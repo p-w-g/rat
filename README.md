@@ -79,6 +79,7 @@ once per immediate subdirectory of the working folder, in parallel.
 | flag                  | meaning                                                                                          |
 | --------------------- | ------------------------------------------------------------------------------------------------- |
 | `--local`              | use the current directory for this run, even if a default folder is set via `cfg here`            |
+| `--concurrency-4`      | run at most 4 directories at once (default: number of CPUs)                                        |
 | `--only-a-b-c`         | only run in subfolders whose path contains `a`, `b`, or `c`                                        |
 | `--skip-a-b-c`         | skip subfolders whose path contains `a`, `b`, or `c` (ignored entirely if `--only` is also given)  |
 | `--sustain`            | wait as long as it takes, ignoring any timeout                                                     |
