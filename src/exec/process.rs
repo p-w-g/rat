@@ -12,20 +12,29 @@ use std::time::{Duration, Instant};
 ///
 /// `sustain` (wait forever) always overrides `timeout`, matching the
 /// original's precedence.
+///
+/// Returns whether the command completed successfully (spawned, ran to
+/// completion within any timeout, and exited with a success status) so
+/// callers can aggregate per-directory outcomes into an overall exit code
+/// instead of always reporting success regardless of what actually happened.
 pub fn run_command(
     command: &str,
     working_directory: &Path,
     sustain: bool,
     timeout: Option<Duration>,
-) {
+) -> bool {
     println!("Running '{command}' in {}", working_directory.display());
 
-    if let Err(e) = run_command_inner(command, working_directory, sustain, timeout) {
-        println!(
-            "Caught exception in {} with error:",
-            working_directory.display()
-        );
-        println!("{e}");
+    match run_command_inner(command, working_directory, sustain, timeout) {
+        Ok(success) => success,
+        Err(e) => {
+            println!(
+                "Caught exception in {} with error:",
+                working_directory.display()
+            );
+            println!("{e}");
+            false
+        }
     }
 }
 
@@ -44,7 +53,7 @@ fn run_command_inner(
     working_directory: &Path,
     sustain: bool,
     timeout: Option<Duration>,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     let (shell, shell_args) = shell_invocation(command);
 
     let mut child = Command::new(shell)
@@ -89,7 +98,7 @@ fn run_command_inner(
         );
         child.kill()?;
         let _ = child.wait();
-        return Ok(());
+        return Ok(false);
     }
 
     let status = child.wait()?;
@@ -110,7 +119,7 @@ fn run_command_inner(
         println!("{stderr_output}");
     }
 
-    Ok(())
+    Ok(status.success())
 }
 
 /// std::process::Child has no built-in timed wait, so poll try_wait() at a
@@ -169,27 +178,27 @@ mod tests {
     #[test]
     fn successful_command_reports_success() {
         let dir = tempfile::tempdir().unwrap();
-        // Just exercising the happy path end-to-end for panics; stdout
-        // capture correctness is implicitly covered by exit-status handling.
-        run_command(&echo_command("hello"), dir.path(), false, None);
+        let success = run_command(&echo_command("hello"), dir.path(), false, None);
+        assert!(success);
     }
 
     #[test]
-    fn failing_command_does_not_panic() {
+    fn failing_command_reports_failure_without_panicking() {
         let dir = tempfile::tempdir().unwrap();
-        run_command(
+        let success = run_command(
             &failing_command_with_stderr("boom"),
             dir.path(),
             false,
             None,
         );
+        assert!(!success);
     }
 
     #[test]
-    fn timeout_kills_long_running_command() {
+    fn timeout_kills_long_running_command_and_reports_failure() {
         let dir = tempfile::tempdir().unwrap();
         let start = Instant::now();
-        run_command(
+        let success = run_command(
             &sleep_command(5),
             dir.path(),
             false,
@@ -197,13 +206,14 @@ mod tests {
         );
         // Should be killed well before the 5s sleep completes.
         assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(!success);
     }
 
     #[test]
     fn sustain_overrides_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let start = Instant::now();
-        run_command(
+        let success = run_command(
             &echo_command("quick"),
             dir.path(),
             true,
@@ -212,5 +222,6 @@ mod tests {
         // Command finishes almost instantly regardless of the tiny timeout,
         // proving sustain suppressed it rather than racing the timeout.
         assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(success);
     }
 }

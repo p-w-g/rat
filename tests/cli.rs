@@ -54,6 +54,41 @@ fn fep_with_no_command_prints_usage_instead_of_crashing() {
 }
 
 #[test]
+fn fep_exits_zero_when_every_directory_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("repo-a")).unwrap();
+    std::fs::create_dir(dir.path().join("repo-b")).unwrap();
+
+    let output = rat()
+        .args(["fep", "exit", "0", "--local"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+}
+
+#[test]
+fn fep_exits_nonzero_when_a_directory_fails() {
+    // Regression test for C1: previously, run_command's per-directory
+    // outcome was discarded entirely (`let _ = handle.join()`), so `rat`
+    // always exited 0 even when the fanned-out command failed in every
+    // single directory - unworkable for CI/scripting use, which is the
+    // tool's primary purpose.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("repo-a")).unwrap();
+    std::fs::create_dir(dir.path().join("repo-b")).unwrap();
+
+    let output = rat()
+        .args(["fep", "exit", "1", "--local"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+}
+
+#[test]
 fn fep_dash_h_shows_usage_instead_of_running_as_a_command() {
     // Regression test: `-h` is a single-dash token, so cli::parse_instance
     // puts it in the payload rather than treating it as a flag. Before the

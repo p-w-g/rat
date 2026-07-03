@@ -23,15 +23,24 @@ use std::time::Duration;
 /// *entire* payload of just a help alias is treated as "show help".
 const HELP_ALIASES: &[&str] = &["-h", "-help"];
 
-pub fn run_parallel(instance: &ParsedArgs) {
+/// Returns whether every directory's command completed successfully, so
+/// `main` can translate that into the process's exit code. Before this,
+/// `run_command`'s result was discarded (`let _ = handle.join()`) and every
+/// invocation exited 0 regardless of whether the fanned-out command failed
+/// everywhere - unworkable for scripting/CI, which is the tool's primary
+/// use case. The usage-message early returns below deliberately still count
+/// as success (nothing was asked to run, so nothing failed); a directory
+/// listing failure counts as a real failure since the requested work
+/// couldn't happen at all.
+pub fn run_parallel(instance: &ParsedArgs) -> bool {
     if instance.payload.len() == 1 && HELP_ALIASES.contains(&instance.payload[0].as_str()) {
         println!("Usage: rat fep <<command>> [--skip-foo-bar-baz || --only-gris-gras-gres]");
-        return;
+        return true;
     }
 
     if instance.payload.is_empty() {
         println!("Usage: rat fep <<command>> [--skip-foo-bar-baz || --only-gris-gras-gres]");
-        return;
+        return true;
     }
 
     let config = config::get_config();
@@ -52,7 +61,7 @@ pub fn run_parallel(instance: &ParsedArgs) {
                 "Couldn't read subdirectories of {}: {e}",
                 working_directory.display()
             );
-            return;
+            return false;
         }
     };
 
@@ -68,9 +77,14 @@ pub fn run_parallel(instance: &ParsedArgs) {
         })
         .collect();
 
+    let mut all_succeeded = true;
     for handle in handles {
-        let _ = handle.join();
+        match handle.join() {
+            Ok(success) => all_succeeded &= success,
+            Err(_) => all_succeeded = false,
+        }
     }
+    all_succeeded
 }
 
 /// Mirrors the original's timeout precedence: an explicit `--timeout` flag

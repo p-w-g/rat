@@ -15,7 +15,11 @@ fn main() {
 
     match command.as_str() {
         "help" | "h" | "-h" | "--h" | "-help" | "--help" => commands::help::show_help(),
-        "fep" => commands::fep::run_parallel(&instance),
+        "fep" => {
+            if !commands::fep::run_parallel(&instance) {
+                std::process::exit(1);
+            }
+        }
         "cfg" => config::evaluate(&instance),
         _ => println!("Unknown command: {command} - refer to help (rat help)"),
     }
