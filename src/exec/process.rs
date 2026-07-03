@@ -17,25 +17,41 @@ use std::time::{Duration, Instant};
 /// completion within any timeout, and exited with a success status) so
 /// callers can aggregate per-directory outcomes into an overall exit code
 /// instead of always reporting success regardless of what actually happened.
+///
+/// The whole per-directory report (header + result + captured output) is
+/// assembled into one string and printed with a single `println!` call.
+/// Before this, each of those was a separate `println!`, and since multiple
+/// directories run concurrently, one directory's header/result/output could
+/// end up visually interleaved with another's between those calls -
+/// `println!` only holds the stdout lock for the duration of one call, not
+/// across several. A single call per directory makes each report an atomic
+/// block in the output no matter how many directories are running at once.
 pub fn run_command(
     command: &str,
     working_directory: &Path,
     sustain: bool,
     timeout: Option<Duration>,
 ) -> bool {
-    println!("Running '{command}' in {}", working_directory.display());
+    let header = format!("Running '{command}' in {}", working_directory.display());
 
     match run_command_inner(command, working_directory, sustain, timeout) {
-        Ok(success) => success,
+        Ok(outcome) => {
+            println!("{header}\n{}", outcome.body);
+            outcome.success
+        }
         Err(e) => {
             println!(
-                "Caught exception in {} with error:",
+                "{header}\nCaught exception in {} with error:\n{e}",
                 working_directory.display()
             );
-            println!("{e}");
             false
         }
     }
+}
+
+struct Outcome {
+    success: bool,
+    body: String,
 }
 
 #[cfg(target_os = "windows")]
@@ -53,7 +69,7 @@ fn run_command_inner(
     working_directory: &Path,
     sustain: bool,
     timeout: Option<Duration>,
-) -> std::io::Result<bool> {
+) -> std::io::Result<Outcome> {
     let (shell, shell_args) = shell_invocation(command);
 
     let mut child = Command::new(shell)
@@ -91,35 +107,38 @@ fn run_command_inner(
 
     if !exited {
         let duration = effective_timeout.expect("timeout branch implies Some");
-        println!(
-            "Command timed out in {} after {} seconds.",
-            working_directory.display(),
-            duration.as_secs()
-        );
         child.kill()?;
         let _ = child.wait();
-        return Ok(false);
+        return Ok(Outcome {
+            success: false,
+            body: format!(
+                "Command timed out in {} after {} seconds.",
+                working_directory.display(),
+                duration.as_secs()
+            ),
+        });
     }
 
     let status = child.wait()?;
     let stdout_output = stdout_handle.join().unwrap_or_default();
     let stderr_output = stderr_handle.join().unwrap_or_default();
 
-    if status.success() {
-        println!(
-            "Command executed successfully in {}.",
+    let body = if status.success() {
+        format!(
+            "Command executed successfully in {}.\n{stdout_output}",
             working_directory.display()
-        );
-        println!("{stdout_output}");
+        )
     } else {
-        println!(
-            "Command failed gracefully in {}.",
+        format!(
+            "Command failed gracefully in {}.\n{stderr_output}",
             working_directory.display()
-        );
-        println!("{stderr_output}");
-    }
+        )
+    };
 
-    Ok(status.success())
+    Ok(Outcome {
+        success: status.success(),
+        body,
+    })
 }
 
 /// std::process::Child has no built-in timed wait, so poll try_wait() at a

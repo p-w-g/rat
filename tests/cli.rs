@@ -110,3 +110,67 @@ fn fep_dash_h_shows_usage_instead_of_running_as_a_command() {
         "fep should not have attempted to run anything, got: {stdout}"
     );
 }
+
+#[cfg(target_os = "windows")]
+fn multi_line_command() -> &'static str {
+    // no built-in `sleep` in cmd.exe; a 1-count ping is the standard
+    // workaround and needs no interactive stdin, unlike `timeout`. The
+    // pauses widen the window during which concurrent directories' output
+    // would interleave if reports weren't printed atomically.
+    "echo line-one && ping -n 1 127.0.0.1 > nul && echo line-two && ping -n 1 127.0.0.1 > nul && echo line-three"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn multi_line_command() -> &'static str {
+    "echo line-one && sleep 0.05 && echo line-two && sleep 0.05 && echo line-three"
+}
+
+#[test]
+fn fep_directory_reports_are_not_interleaved() {
+    // Regression test for M3: each directory's report used to be printed
+    // via several separate `println!` calls (header, then result, then
+    // captured output). `println!` only holds the stdout lock for one call,
+    // not across several, so with directories genuinely running at once,
+    // one directory's lines could end up interleaved with another's. Now
+    // each directory's whole report is built into one string and printed
+    // with a single `println!`, so it must appear as one contiguous block.
+    let dir = tempfile::tempdir().unwrap();
+    let labels = ["alpha", "beta"];
+    for label in labels {
+        std::fs::create_dir(dir.path().join(label)).unwrap();
+    }
+
+    let output = rat()
+        .arg("fep")
+        .args(multi_line_command().split_whitespace())
+        .args(["--local", "--concurrency-2"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let report_blocks: Vec<&str> = stdout.split("Running '").skip(1).collect();
+    assert_eq!(
+        report_blocks.len(),
+        labels.len(),
+        "expected one report per directory, got:\n{stdout}"
+    );
+
+    for block in &report_blocks {
+        let header_end = block.find('\n').expect("report has a header line");
+        let header = &block[..header_end];
+        let (_, this_dir) = header
+            .split_once("' in ")
+            .expect("header is \"<command>' in <path>\"");
+
+        for label in labels {
+            let other_dir = dir.path().join(label).display().to_string();
+            if other_dir != this_dir {
+                assert!(
+                    !block.contains(&other_dir),
+                    "report for {this_dir} unexpectedly mentions {other_dir} - reports are interleaved:\n{stdout}"
+                );
+            }
+        }
+    }
+}
