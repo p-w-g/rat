@@ -12,11 +12,13 @@ use std::time::{Duration, Instant};
 ///
 /// `sustain` (wait forever) always overrides `timeout`, matching the
 /// original's precedence.
-pub fn run_command(command: &str, working_directory: &Path, sustain: bool, timeout: Option<Duration>) {
-    println!(
-        "Running '{command}' in {}",
-        working_directory.display()
-    );
+pub fn run_command(
+    command: &str,
+    working_directory: &Path,
+    sustain: bool,
+    timeout: Option<Duration>,
+) {
+    println!("Running '{command}' in {}", working_directory.display());
 
     if let Err(e) = run_command_inner(command, working_directory, sustain, timeout) {
         println!(
@@ -113,10 +115,7 @@ fn run_command_inner(
 
 /// std::process::Child has no built-in timed wait, so poll try_wait() at a
 /// short interval until either the process exits or the timeout elapses.
-fn wait_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> std::io::Result<bool> {
+fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> std::io::Result<bool> {
     const POLL_INTERVAL: Duration = Duration::from_millis(50);
     let start = Instant::now();
 
@@ -178,7 +177,12 @@ mod tests {
     #[test]
     fn failing_command_does_not_panic() {
         let dir = tempfile::tempdir().unwrap();
-        run_command(&failing_command_with_stderr("boom"), dir.path(), false, None);
+        run_command(
+            &failing_command_with_stderr("boom"),
+            dir.path(),
+            false,
+            None,
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::{load_config, save_config_at, Config};
+use super::{Config, load_config, save_config_at};
 use std::io;
 use std::path::Path;
 

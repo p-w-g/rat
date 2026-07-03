@@ -202,8 +202,8 @@ mod tests {
         std::fs::create_dir(dir.path().join("api")).unwrap();
         std::fs::create_dir(dir.path().join(".git")).unwrap();
 
-        let result = available_directories(dir.path(), Some(&strings(&[".git"])), None, None)
-            .unwrap();
+        let result =
+            available_directories(dir.path(), Some(&strings(&[".git"])), None, None).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].file_name().unwrap().to_string_lossy(), "api");

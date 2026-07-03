@@ -55,12 +55,7 @@ mod tests {
             payload: payload.iter().map(|s| s.to_string()).collect(),
             options: options
                 .iter()
-                .map(|(k, v)| {
-                    (
-                        k.to_string(),
-                        v.iter().map(|s| s.to_string()).collect(),
-                    )
-                })
+                .map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect()))
                 .collect(),
         }
     }

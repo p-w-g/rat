@@ -1,4 +1,4 @@
-use crate::cli::{dirs, ParsedArgs};
+use crate::cli::{ParsedArgs, dirs};
 use crate::config::{self, Config};
 use crate::exec::process;
 use std::time::Duration;
@@ -29,17 +29,17 @@ pub fn run_parallel(instance: &ParsedArgs) {
     let skip = instance.options.get("skip").map(Vec::as_slice);
     let only = instance.options.get("only").map(Vec::as_slice);
 
-    let available_dirs =
-        match dirs::available_directories(&working_directory, ignored, skip, only) {
-            Ok(dirs) => dirs,
-            Err(e) => {
-                println!(
-                    "Couldn't read subdirectories of {}: {e}",
-                    working_directory.display()
-                );
-                return;
-            }
-        };
+    let available_dirs = match dirs::available_directories(&working_directory, ignored, skip, only)
+    {
+        Ok(dirs) => dirs,
+        Err(e) => {
+            println!(
+                "Couldn't read subdirectories of {}: {e}",
+                working_directory.display()
+            );
+            return;
+        }
+    };
 
     let command = instance.payload.join(" ");
     let sustain = instance.options.contains_key("sustain");
@@ -105,7 +105,10 @@ mod tests {
             time_out: Some(99),
             ..Default::default()
         };
-        assert_eq!(resolve_timeout(&instance, &config), Some(Duration::from_secs(10)));
+        assert_eq!(
+            resolve_timeout(&instance, &config),
+            Some(Duration::from_secs(10))
+        );
     }
 
     #[test]
@@ -115,7 +118,10 @@ mod tests {
             time_out: Some(45),
             ..Default::default()
         };
-        assert_eq!(resolve_timeout(&instance, &config), Some(Duration::from_secs(45)));
+        assert_eq!(
+            resolve_timeout(&instance, &config),
+            Some(Duration::from_secs(45))
+        );
     }
 
     #[test]
