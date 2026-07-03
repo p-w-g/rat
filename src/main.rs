@@ -4,6 +4,8 @@
 mod cli;
 #[allow(unused)]
 mod config;
+#[allow(unused)]
+mod exec;
 
 fn main() {
     println!("Hello, world!");
