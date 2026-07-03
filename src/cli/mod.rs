@@ -1,3 +1,5 @@
+pub mod dirs;
+
 use std::collections::HashMap;
 
 const VALID_OPTIONS: &[&str] = &["sustain", "local", "skip", "only", "timeout", "all"];
