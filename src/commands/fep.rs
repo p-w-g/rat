@@ -13,7 +13,22 @@ use std::time::Duration;
 /// anything else, so `ath fep` (or `ath fep --local` etc.) with no command
 /// crashed with an uncaught KeyNotFoundException. Guarded here with a usage
 /// message instead.
+/// Single-dash tokens are payload as far as cli::parse_instance is concerned
+/// (see its own doc comment), so a bare `rat fep -h` would otherwise fall
+/// straight through to the shell-out below and try to run the literal
+/// command `-h` in every subdirectory instead of showing help. Checked here,
+/// before the command is ever assembled, rather than in the parser: it's
+/// fep's own payload that's ambiguous (a real wrapped command may legitimately
+/// want to pass `-h` through, e.g. `rat fep grep -h pattern`), so only an
+/// *entire* payload of just a help alias is treated as "show help".
+const HELP_ALIASES: &[&str] = &["-h", "-help"];
+
 pub fn run_parallel(instance: &ParsedArgs) {
+    if instance.payload.len() == 1 && HELP_ALIASES.contains(&instance.payload[0].as_str()) {
+        println!("Usage: rat fep <<command>> [--skip-foo-bar-baz || --only-gris-gras-gres]");
+        return;
+    }
+
     if instance.payload.is_empty() {
         println!("Usage: rat fep <<command>> [--skip-foo-bar-baz || --only-gris-gras-gres]");
         return;

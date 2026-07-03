@@ -52,3 +52,26 @@ fn fep_with_no_command_prints_usage_instead_of_crashing() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage: rat fep"));
 }
+
+#[test]
+fn fep_dash_h_shows_usage_instead_of_running_as_a_command() {
+    // Regression test: `-h` is a single-dash token, so cli::parse_instance
+    // puts it in the payload rather than treating it as a flag. Before the
+    // fix, fep would take that payload and shell out the literal command
+    // `-h` in every subdirectory instead of showing help.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("repo-a")).unwrap();
+
+    let output = rat()
+        .args(["fep", "-h", "--local"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage: rat fep"));
+    assert!(
+        !stdout.contains("Running"),
+        "fep should not have attempted to run anything, got: {stdout}"
+    );
+}

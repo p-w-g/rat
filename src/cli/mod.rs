@@ -49,7 +49,15 @@ fn parse_argument(arg: &str, parsed: &mut ParsedArgs) {
 fn parse_option(option: &str, parsed: &mut ParsedArgs) {
     let mut parts = option.split('-');
     let key = parts.next().unwrap_or("").to_string();
-    let values: Vec<String> = parts.map(|s| s.to_string()).collect();
+    // A leading/trailing/doubled dash (e.g. "--skip-" or "--only--a-b") produces
+    // empty segments here. Left unfiltered, an empty string matches every
+    // substring check downstream in cli::dirs (`"anything".contains("")` is
+    // always true), silently turning `--skip-` into "skip every directory"
+    // and `--only--a-b` into "only" not restricting anything at all.
+    let values: Vec<String> = parts
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
 
     parsed.options.entry(key).or_default().extend(values);
 }
@@ -109,6 +117,27 @@ mod tests {
         let parsed = parse_instance(&args(&["--skip-a", "--skip-b"]));
         assert_eq!(
             parsed.options.get("skip"),
+            Some(&vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn trailing_dash_produces_no_values_not_an_empty_string_value() {
+        // "--skip-" must behave like a no-op filter (no values), not like a
+        // filter containing "" - which would match (and remove) every
+        // directory via `.contains("")` downstream.
+        let parsed = parse_instance(&args(&["--skip-"]));
+        assert_eq!(parsed.options.get("skip"), Some(&vec![]));
+    }
+
+    #[test]
+    fn doubled_dash_skips_the_empty_segment() {
+        // "--only--a-b" must yield ["a", "b"], not ["", "a", "b"] - an empty
+        // value would match every directory via `.contains("")`, silently
+        // defeating the whole point of `--only`.
+        let parsed = parse_instance(&args(&["--only--a-b"]));
+        assert_eq!(
+            parsed.options.get("only"),
             Some(&vec!["a".to_string(), "b".to_string()])
         );
     }
