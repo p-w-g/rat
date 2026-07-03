@@ -73,18 +73,60 @@ pub fn run_parallel(instance: &ParsedArgs) -> bool {
         .into_iter()
         .map(|dir| {
             let command = command.clone();
-            std::thread::spawn(move || process::run_command(&command, &dir, sustain, timeout))
+            let dir_display = dir.display().to_string();
+            let handle =
+                std::thread::spawn(move || process::run_command(&command, &dir, sustain, timeout));
+            (dir_display, handle)
         })
         .collect();
 
+    let results = handles
+        .into_iter()
+        .map(|(dir_display, handle)| (dir_display, handle.join()))
+        .collect();
+    aggregate(results)
+}
+
+/// Reduces each directory's outcome (`Ok(success)`, or `Err(panic payload)`
+/// if the worker thread itself panicked) into one overall success flag.
+///
+/// Before this existed, a panicking worker was invisible: `let _ =
+/// handle.join()` discarded the `Err` with no message at all, unlike the
+/// explicit "Caught exception in {dir}" path used for ordinary IO errors -
+/// a directory could silently vanish from the output. Kept as a plain
+/// function over `Vec<(String, thread::Result<bool>)>` rather than a
+/// generic worker-pool abstraction so the panic-handling logic itself is
+/// unit-testable without needing to actually crash a thread in a test.
+fn aggregate(results: Vec<(String, std::thread::Result<bool>)>) -> bool {
     let mut all_succeeded = true;
-    for handle in handles {
-        match handle.join() {
+    for (dir_display, result) in results {
+        match result {
             Ok(success) => all_succeeded &= success,
-            Err(_) => all_succeeded = false,
+            Err(panic_payload) => {
+                all_succeeded = false;
+                println!(
+                    "Worker for {dir_display} panicked: {}",
+                    panic_message(panic_payload.as_ref())
+                );
+            }
         }
     }
     all_succeeded
+}
+
+/// Best-effort extraction of a panic's message. `std::panic::set_hook`
+/// already prints the full panic location/backtrace (respecting
+/// `RUST_BACKTRACE`) to stderr the moment it happens, independent of this -
+/// this is just a directory-scoped summary tying that panic back to which
+/// subdirectory it came from, which the default hook has no way to know.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 /// Mirrors the original's timeout precedence: an explicit `--timeout` flag
@@ -174,5 +216,54 @@ mod tests {
         // flag presence still takes precedence over config, even though its
         // value can't be used - it does NOT fall back to the config value.
         assert_eq!(resolve_timeout(&instance, &config), None);
+    }
+
+    fn panicked(message: &'static str) -> std::thread::Result<bool> {
+        Err(Box::new(message))
+    }
+
+    #[test]
+    fn aggregate_is_true_when_every_directory_succeeds() {
+        let results = vec![("a".to_string(), Ok(true)), ("b".to_string(), Ok(true))];
+        assert!(aggregate(results));
+    }
+
+    #[test]
+    fn aggregate_is_false_when_any_directory_fails() {
+        let results = vec![("a".to_string(), Ok(true)), ("b".to_string(), Ok(false))];
+        assert!(!aggregate(results));
+    }
+
+    #[test]
+    fn aggregate_reports_failure_on_panic_instead_of_being_silently_dropped() {
+        // Regression test for H3: a panicking worker used to be discarded
+        // entirely via `let _ = handle.join()`, so it neither counted as a
+        // failure nor printed anything - a directory could silently vanish.
+        let results = vec![
+            ("dir-a".to_string(), Ok(true)),
+            ("dir-b".to_string(), panicked("boom")),
+        ];
+        assert!(!aggregate(results));
+    }
+
+    #[test]
+    fn panic_message_extracts_str_panic_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(payload.as_ref()), "boom");
+    }
+
+    #[test]
+    fn panic_message_extracts_string_panic_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(String::from("boom"));
+        assert_eq!(panic_message(payload.as_ref()), "boom");
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_unknown_payload_type() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        assert_eq!(
+            panic_message(payload.as_ref()),
+            "<non-string panic payload>"
+        );
     }
 }
