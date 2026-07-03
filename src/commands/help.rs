@@ -22,6 +22,8 @@ Available commands:
 
                       --local             use CWD for this run, even if a
                                           default folder is configured
+                      --concurrency-4     run at most 4 directories at once
+                                          (default: number of CPUs)
                       --only-a-b-c        only run in subfolders whose path
                                           contains "a", "b", or "c"
                       --skip-a-b-c        skip subfolders whose path contains

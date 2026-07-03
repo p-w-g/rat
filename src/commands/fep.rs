@@ -1,7 +1,13 @@
 use crate::cli::{ParsedArgs, dirs};
 use crate::config::{self, Config};
 use crate::exec::process;
+use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::Duration;
+
+/// Used when `--concurrency` isn't given and the number of available CPUs
+/// can't be determined.
+const DEFAULT_MAX_CONCURRENCY: usize = 8;
 
 /// Runs the fep command's payload in every available subdirectory in
 /// parallel, mirroring FEP.cs's `RunParallelAsync`. Uses OS threads (one per
@@ -68,23 +74,78 @@ pub fn run_parallel(instance: &ParsedArgs) -> bool {
     let command = instance.payload.join(" ");
     let sustain = instance.options.contains_key("sustain");
     let timeout = resolve_timeout(instance, &config);
+    let max_concurrency = resolve_concurrency(instance);
 
-    let handles: Vec<_> = available_dirs
-        .into_iter()
-        .map(|dir| {
-            let command = command.clone();
-            let dir_display = dir.display().to_string();
-            let handle =
-                std::thread::spawn(move || process::run_command(&command, &dir, sustain, timeout));
-            (dir_display, handle)
-        })
-        .collect();
-
-    let results = handles
-        .into_iter()
-        .map(|(dir_display, handle)| (dir_display, handle.join()))
-        .collect();
+    let results = run_bounded(&available_dirs, max_concurrency, |dir| {
+        process::run_command(&command, dir, sustain, timeout)
+    });
     aggregate(results)
+}
+
+/// Determines how many directories may run at once. An explicit
+/// `--concurrency-N` flag always wins; otherwise falls back to the number
+/// of available CPUs (a reasonable default for this kind of fan-out work),
+/// or `DEFAULT_MAX_CONCURRENCY` if that can't be determined.
+///
+/// Fix: previously there was no limit at all - every available directory
+/// got its own OS thread (each of which itself spawns a child process plus
+/// two pipe-reader threads) simultaneously. A workspace with a few hundred
+/// subdirectories could spawn well over a thousand threads/processes in one
+/// invocation, with no backpressure.
+fn resolve_concurrency(instance: &ParsedArgs) -> usize {
+    if let Some(values) = instance.options.get("concurrency") {
+        match values.first().and_then(|s| s.parse::<usize>().ok()) {
+            Some(n) if n > 0 => return n,
+            _ => {
+                println!("Ignoring --concurrency: no valid positive value given, using default.")
+            }
+        }
+    }
+
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(DEFAULT_MAX_CONCURRENCY)
+}
+
+/// Runs `work` once per directory, at most `max_concurrency` at a time, and
+/// returns each directory's display path paired with its outcome.
+///
+/// Directories are processed in fixed-size chunks: the next chunk only
+/// starts once every thread in the current one has finished. That's simpler
+/// to reason about (and to test deterministically) than a persistent
+/// worker-pool/queue, at the cost of some throughput if runtimes are very
+/// uneven within a chunk - an acceptable trade since correctness/safety, not
+/// peak throughput, is what bounding concurrency is for here.
+///
+/// Uses `thread::scope` rather than wrapping `work` in an `Arc`: each
+/// chunk's scope blocks until every thread spawned inside it has finished,
+/// so borrowing `work` and `dir` for the scope's duration is sound without
+/// any shared-ownership bookkeeping.
+fn run_bounded<F>(
+    dirs: &[PathBuf],
+    max_concurrency: usize,
+    work: F,
+) -> Vec<(String, thread::Result<bool>)>
+where
+    F: Fn(&Path) -> bool + Sync,
+{
+    let mut results = Vec::with_capacity(dirs.len());
+    for chunk in dirs.chunks(max_concurrency.max(1)) {
+        thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|dir| {
+                    let dir_display = dir.display().to_string();
+                    (dir_display, scope.spawn(|| work(dir)))
+                })
+                .collect();
+
+            for (dir_display, handle) in handles {
+                results.push((dir_display, handle.join()));
+            }
+        });
+    }
+    results
 }
 
 /// Reduces each directory's outcome (`Ok(success)`, or `Err(panic payload)`
@@ -265,5 +326,91 @@ mod tests {
             panic_message(payload.as_ref()),
             "<non-string panic payload>"
         );
+    }
+
+    fn default_concurrency() -> usize {
+        thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(DEFAULT_MAX_CONCURRENCY)
+    }
+
+    #[test]
+    fn resolve_concurrency_uses_explicit_flag_value() {
+        let instance = instance_with_options(&[("concurrency", &["3"])]);
+        assert_eq!(resolve_concurrency(&instance), 3);
+    }
+
+    #[test]
+    fn resolve_concurrency_ignores_zero_and_falls_back_to_default() {
+        let instance = instance_with_options(&[("concurrency", &["0"])]);
+        assert_eq!(resolve_concurrency(&instance), default_concurrency());
+    }
+
+    #[test]
+    fn resolve_concurrency_ignores_invalid_value_and_falls_back_to_default() {
+        let instance = instance_with_options(&[("concurrency", &["not-a-number"])]);
+        assert_eq!(resolve_concurrency(&instance), default_concurrency());
+    }
+
+    #[test]
+    fn resolve_concurrency_falls_back_to_default_when_flag_absent() {
+        let instance = instance_with_options(&[]);
+        assert_eq!(resolve_concurrency(&instance), default_concurrency());
+    }
+
+    #[test]
+    fn run_bounded_never_exceeds_the_configured_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dirs: Vec<PathBuf> = (0..6).map(|i| PathBuf::from(format!("dir-{i}"))).collect();
+        let current = AtomicUsize::new(0);
+        let max_seen = AtomicUsize::new(0);
+
+        let results = run_bounded(&dirs, 2, |_dir| {
+            let in_flight = current.fetch_add(1, Ordering::SeqCst) + 1;
+            max_seen.fetch_max(in_flight, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(50));
+            current.fetch_sub(1, Ordering::SeqCst);
+            true
+        });
+
+        assert_eq!(results.len(), 6);
+        assert!(
+            max_seen.load(Ordering::SeqCst) <= 2,
+            "expected at most 2 concurrent workers, saw {}",
+            max_seen.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn run_bounded_serializes_when_limit_is_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dirs: Vec<PathBuf> = (0..4).map(|i| PathBuf::from(format!("dir-{i}"))).collect();
+        let current = AtomicUsize::new(0);
+        let max_seen = AtomicUsize::new(0);
+
+        let results = run_bounded(&dirs, 1, |_dir| {
+            let in_flight = current.fetch_add(1, Ordering::SeqCst) + 1;
+            max_seen.fetch_max(in_flight, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(20));
+            current.fetch_sub(1, Ordering::SeqCst);
+            true
+        });
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(max_seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn run_bounded_propagates_directory_results() {
+        let dirs: Vec<PathBuf> = vec![PathBuf::from("ok"), PathBuf::from("bad")];
+        let results = run_bounded(&dirs, 2, |dir| dir.to_string_lossy() != "bad");
+
+        let outcomes: Vec<bool> = results
+            .into_iter()
+            .map(|(_, result)| result.unwrap())
+            .collect();
+        assert_eq!(outcomes, vec![true, false]);
     }
 }

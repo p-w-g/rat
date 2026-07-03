@@ -2,7 +2,15 @@ pub mod dirs;
 
 use std::collections::HashMap;
 
-const VALID_OPTIONS: &[&str] = &["sustain", "local", "skip", "only", "timeout", "all"];
+const VALID_OPTIONS: &[&str] = &[
+    "sustain",
+    "local",
+    "skip",
+    "only",
+    "timeout",
+    "all",
+    "concurrency",
+];
 
 #[derive(Debug, Default, PartialEq)]
 pub struct ParsedArgs {
