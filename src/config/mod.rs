@@ -1,8 +1,10 @@
+mod commands;
 mod ignore;
 mod print;
 mod timeout;
 mod workdir;
 
+pub use commands::evaluate;
 pub use ignore::{set_ignored_directories, unset_ignored_directories};
 pub use print::{print_config, print_config_path};
 pub use timeout::{set_timeout, unset_timeout};
