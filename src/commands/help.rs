@@ -8,12 +8,47 @@ Available commands:
 
     * help          Show help information
 
-    * fep           Run command for nested folders in CWD.
-                    takes a list of optional folders to either skip or run command in, separated by '-'
-                    `rat fep <<command>> [--skip-foo-bar-baz || --only-gris-gras-gres]`
+    * fep           Run a shell command inside every immediate subdirectory
+                    of the working folder, in parallel.
 
-                    by default runs in current working folder or set working folder,
-                    which can be temporarily overrun with `--local` flag
+                    Usage: `rat fep <<command>> [flags]`
+                    Example: `rat fep git pull`
+
+                    By default runs in the current working folder, or the
+                    folder set with `cfg here`; override that for one call
+                    with the `--local` flag.
+
+                    fep's own flags (all optional):
+
+                      --local             use CWD for this run, even if a
+                                          default folder is configured
+                      --only-a-b-c        only run in subfolders whose path
+                                          contains "a", "b", or "c"
+                      --skip-a-b-c        skip subfolders whose path contains
+                                          "a", "b", or "c" (ignored entirely
+                                          if --only is also given)
+                      --sustain           wait as long as it takes, ignoring
+                                          any timeout
+                      --timeout-30        timeout this run after 30 seconds,
+                                          overriding the configured timeout
+                                          (--timeout-0 means a 0-second
+                                          timeout, NOT "disabled" - use
+                                          --sustain or `cfg nto` for that)
+
+                    IMPORTANT: rat parses these flags out of <<command>>
+                    itself, before your command ever runs. Any `--word...`
+                    you pass that starts with local/skip/only/sustain/timeout
+                    is captured by rat instead of reaching your command, and
+                    any other unrecognized `--flag` is silently dropped
+                    rather than forwarded. So:
+
+                      `rat fep git merge --skip-commit`
+                      -> rat reads "--skip-commit" as its own --skip flag;
+                         git never sees --skip-commit at all.
+
+                    Single-dash flags (`-m`, `-rf`, `-n`, ...) are never
+                    touched by rat and always reach your command untouched,
+                    e.g. `rat fep git commit -m "message"` is safe.
 
     * cfg (config)
     cfg path        prints out config file's path
