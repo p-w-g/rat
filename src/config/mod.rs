@@ -55,10 +55,6 @@ pub fn save_config_at(path: &Path, config: &Config) -> io::Result<()> {
     Ok(())
 }
 
-pub fn save_config(config: &Config) -> io::Result<()> {
-    save_config_at(&config_path(), config)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
