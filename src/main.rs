@@ -3,6 +3,8 @@
 #[allow(unused)]
 mod cli;
 #[allow(unused)]
+mod commands;
+#[allow(unused)]
 mod config;
 #[allow(unused)]
 mod exec;
