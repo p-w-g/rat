@@ -82,6 +82,18 @@ fn cfg_with_no_subcommand_prints_usage_instead_of_crashing() {
 }
 
 #[test]
+fn cfg_dash_h_shows_usage_instead_of_unknown_command() {
+    // Regression test: `rat cfg -h` used to print "Unknown config command:
+    // -h" instead of usage, unlike `rat fep -h`, which has always shown
+    // fep's own usage - see fep_dash_h_shows_usage_instead_of_running_as_a_command.
+    let output = rat().args(["cfg", "-h"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage: rat cfg"));
+    assert!(!stdout.contains("Unknown config command"));
+}
+
+#[test]
 fn fep_with_no_command_prints_usage_instead_of_crashing() {
     let output = rat().arg("fep").output().unwrap();
     assert!(output.status.success());

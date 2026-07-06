@@ -5,6 +5,15 @@ use super::{
 use crate::cli::ParsedArgs;
 use std::io;
 
+/// `-h`/`-help` as the only argument to `cfg` shows usage, mirroring how
+/// `fep` treats the same two aliases (see fep's own `HELP_ALIASES`). Before
+/// this, `rat cfg -h` fell through to the `_` arm and printed "Unknown
+/// config command: -h" instead of any actual help - inconsistent with
+/// `rat fep -h`, which has always shown fep's usage.
+const HELP_ALIASES: &[&str] = &["-h", "-help"];
+
+const USAGE: &str = "Usage: rat cfg <path|file|here|away|ignore|heed|to|nto>";
+
 /// Dispatches `cfg <subcommand> [args...]`, mirroring ConfigSwitch.cs's
 /// `Evaluate`.
 ///
@@ -15,10 +24,16 @@ use std::io;
 /// (otherwise dead) empty-string check. Both now print a usage message.
 pub fn evaluate(instance: &ParsedArgs) {
     let Some(command) = instance.payload.first() else {
-        println!("Usage: rat cfg <path|file|here|away|ignore|heed|to|nto>");
+        println!("{USAGE}");
         return;
     };
     let command = command.to_lowercase();
+
+    if instance.payload.len() == 1 && HELP_ALIASES.contains(&command.as_str()) {
+        println!("{USAGE}");
+        return;
+    }
+
     let payload = &instance.payload[1..];
 
     match command.as_str() {
@@ -73,5 +88,14 @@ mod tests {
     #[test]
     fn unknown_subcommand_does_not_panic() {
         evaluate(&instance(&["bogus"], &[]));
+    }
+
+    #[test]
+    fn dash_h_is_treated_as_a_help_alias_not_an_unknown_command() {
+        // Regression test: `-h` used to fall through to the `_` arm and
+        // print "Unknown config command: -h" instead of usage, unlike
+        // `rat fep -h`, which has always shown fep's own usage.
+        assert!(HELP_ALIASES.contains(&"-h"));
+        evaluate(&instance(&["-h"], &[]));
     }
 }
