@@ -92,20 +92,10 @@ fn build_shell_command(shell: &str, command: &str) -> Command {
     cmd
 }
 
-/// On Unix, the spawned shell is put into its own new process group (see
-/// `kill_process_tree`'s doc comment for why). Note this is a deliberate
-/// trade-off: it also means an interactive Ctrl-C at the terminal, which
-/// signals only the terminal's foreground process group, no longer reaches
-/// this shell or its descendants the way it would if they shared rat's own
-/// group - the same group-isolation that lets us clean up a whole tree on
-/// timeout means rat itself has to be the one to do that cleanup, rather
-/// than relying on the terminal to signal everything at once.
 #[cfg(not(target_os = "windows"))]
 fn build_shell_command(shell: &str, command: &str) -> Command {
-    use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(shell);
     cmd.arg("-c").arg(command);
-    cmd.process_group(0);
     cmd
 }
 
@@ -240,25 +230,75 @@ fn append_stream(body: &mut String, label: &str, content: &str) {
 /// since the actual work can keep consuming CPU/network/disk indefinitely
 /// after rat has already reported the directory as timed out and moved on.
 ///
-/// - Unix: `shell_command` puts the shell in its own new process group
-///   (`process_group(0)`), which any descendants it forks inherit by
-///   default; shelling out to `kill -KILL -<pgid>` (negative pid = "the
-///   whole group") reaches all of them without touching rat's own group.
-/// - Windows: `taskkill /T` walks the same parent-child tree Windows
-///   already tracks for every process, so no equivalent setup is needed at
-///   spawn time.
+/// - Windows: `taskkill /T` walks the parent-child tree Windows already
+///   tracks for every process.
+/// - Unix: walks the same kind of parent-child tree by hand (see
+///   `descendant_pids`) rather than relying on process groups. An earlier
+///   version put the shell in its own process group at spawn time and
+///   killed by negative pid (`kill -KILL -<pgid>`), on the assumption that
+///   every descendant would inherit that group - but a shell's *background*
+///   jobs (`cmd &`) can end up in a different process group than the shell
+///   itself even in a non-interactive `bash -c` invocation, since bash
+///   still does its own job-control bookkeeping regardless of a controlling
+///   terminal. That meant a backgrounded grandchild could survive the kill
+///   entirely, confirmed by this surviving in CI on Linux even though it
+///   passed everywhere it was tested by hand. Walking real parent-child
+///   PIDs instead doesn't depend on which process group anything ended up
+///   in, and killing by plain positive pid also sidesteps `kill`
+///   implementations that parse a leading `-` on the pid itself as another
+///   option rather than a negative-pid operand.
 ///
-/// Both shell out to a standard OS utility rather than using raw
+/// Both platforms shell out to a standard OS utility rather than using raw
 /// FFI/job-object APIs, keeping this dependency- and unsafe-free; a failed
 /// kill attempt (e.g. the process already exited) is not itself an error
 /// here; whatever remains is caught by the `child.wait()` right after.
 #[cfg(not(target_os = "windows"))]
 fn kill_process_tree(child: &mut std::process::Child) {
     let pid = child.id();
+    for descendant in descendant_pids(pid) {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(descendant.to_string())
+            .status();
+    }
     let _ = Command::new("kill")
         .arg("-KILL")
-        .arg(format!("-{pid}"))
+        .arg(pid.to_string())
         .status();
+}
+
+/// Every process descended from `root`, found by walking a one-shot
+/// snapshot of the whole system's (pid, ppid) pairs from `ps`. `ps -A -o
+/// pid=,ppid=` (all processes, just those two columns, no header) is
+/// supported identically by GNU (Linux) and BSD (macOS) `ps` - unlike
+/// `-e`, which means "all processes" on GNU but "show environment" on BSD.
+#[cfg(not(target_os = "windows"))]
+fn descendant_pids(root: u32) -> Vec<u32> {
+    let Ok(output) = Command::new("ps").args(["-A", "-o", "pid=,ppid="]).output() else {
+        return Vec::new();
+    };
+    let table = String::from_utf8_lossy(&output.stdout);
+    let pairs: Vec<(u32, u32)> = table
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid = fields.next()?.parse().ok()?;
+            Some((pid, ppid))
+        })
+        .collect();
+
+    let mut descendants = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for &(pid, ppid) in &pairs {
+            if ppid == parent && !descendants.contains(&pid) {
+                descendants.push(pid);
+                frontier.push(pid);
+            }
+        }
+    }
+    descendants
 }
 
 #[cfg(target_os = "windows")]
