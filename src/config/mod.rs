@@ -48,11 +48,30 @@ pub fn get_config() -> Config {
     load_config(&config_path())
 }
 
+/// Writes `config` to `path` via write-then-rename rather than a direct
+/// `fs::write`, so a process killed mid-write (Ctrl-C, crash, ...) can't
+/// leave `path` truncated/corrupted - the rename only replaces the old
+/// file once the new contents are fully and successfully written.
+/// `fs::rename` onto an existing path is atomic on both POSIX (`rename(2)`)
+/// and Windows (`MoveFileExW` with replace-existing, which is what
+/// `std::fs::rename` uses there).
 pub fn save_config_at(path: &Path, config: &Config) -> io::Result<()> {
     let json = serde_json::to_string_pretty(config)?;
-    std::fs::write(path, json)?;
+
+    let temp_path = temp_path_for(path);
+    std::fs::write(&temp_path, json)?;
+    std::fs::rename(&temp_path, path)?;
+
     println!("Config file updated successfully!");
     Ok(())
+}
+
+fn temp_path_for(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(".ratconfig");
+    path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
 }
 
 #[cfg(test)]
@@ -85,6 +104,24 @@ mod tests {
 
         save_config_at(&path, &config).unwrap();
         assert_eq!(load_config(&path), config);
+    }
+
+    #[test]
+    fn save_config_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".ratconfig");
+
+        save_config_at(&path, &Config::default()).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![path],
+            "expected only the config file itself, no leftover temp file"
+        );
     }
 
     #[test]

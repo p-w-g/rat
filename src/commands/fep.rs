@@ -1,7 +1,12 @@
+use super::execution_mode::ExecutionMode;
+use crate::cli::filter::FilterExpression;
 use crate::cli::{ParsedArgs, dirs};
 use crate::config::{self, Config};
-use crate::exec::process;
+use crate::exec::{process, quoting};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -53,14 +58,21 @@ pub fn run_parallel(instance: &ParsedArgs) -> bool {
 
     let local_flag = instance.options.contains_key("local");
     let working_directory =
-        dirs::assume_working_directory(local_flag, config.default_folder.as_deref());
+        match dirs::assume_working_directory(local_flag, config.default_folder.as_deref()) {
+            Ok(dir) => dir,
+            Err(e) => {
+                println!("Couldn't determine the working directory: {e}");
+                return false;
+            }
+        };
 
     let ignored = config.ignored_folders.as_deref();
-    let skip = instance.options.get("skip").map(Vec::as_slice);
-    let only = instance.options.get("only").map(Vec::as_slice);
+    let filter = FilterExpression::new(
+        instance.options.get("only").map(Vec::as_slice),
+        instance.options.get("skip").map(Vec::as_slice),
+    );
 
-    let available_dirs = match dirs::available_directories(&working_directory, ignored, skip, only)
-    {
+    let available_dirs = match dirs::available_directories(&working_directory, ignored, &filter) {
         Ok(dirs) => dirs,
         Err(e) => {
             println!(
@@ -71,15 +83,40 @@ pub fn run_parallel(instance: &ParsedArgs) -> bool {
         }
     };
 
-    let command = instance.payload.join(" ");
+    if available_dirs.is_empty() {
+        println!(
+            "No matching subdirectories found in {} (after ignore/--only/--skip filtering) - \
+             nothing to run.",
+            working_directory.display()
+        );
+        return true;
+    }
+
+    let command = quoting::build_command_line(&instance.payload);
     let sustain = instance.options.contains_key("sustain");
     let timeout = resolve_timeout(instance, &config);
-    let max_concurrency = resolve_concurrency(instance);
+    let execution_mode = resolve_execution_mode(instance);
 
-    let results = run_bounded(&available_dirs, max_concurrency, |dir| {
+    let results = run_bounded(&available_dirs, execution_mode.concurrency_limit(), |dir| {
         process::run_command(&command, dir, sustain, timeout)
     });
     aggregate(results)
+}
+
+/// Determines whether this run is sequential (`--sync`) or bounded-parallel.
+/// `--sync` always wins over `--concurrency`: forcing the same scheduler
+/// (`run_bounded`) down to a limit of 1 keeps one code path responsible for
+/// ordering/joining directories regardless of which mode is active, rather
+/// than duplicating a separate "run one at a time" loop.
+fn resolve_execution_mode(instance: &ParsedArgs) -> ExecutionMode {
+    if instance.options.contains_key("sync") {
+        if instance.options.contains_key("concurrency") {
+            println!("Ignoring --concurrency: --sync forces one directory at a time.");
+        }
+        return ExecutionMode::Sync;
+    }
+
+    ExecutionMode::Concurrent(resolve_concurrency(instance))
 }
 
 /// Determines how many directories may run at once. An explicit
@@ -110,17 +147,27 @@ fn resolve_concurrency(instance: &ParsedArgs) -> usize {
 /// Runs `work` once per directory, at most `max_concurrency` at a time, and
 /// returns each directory's display path paired with its outcome.
 ///
-/// Directories are processed in fixed-size chunks: the next chunk only
-/// starts once every thread in the current one has finished. That's simpler
-/// to reason about (and to test deterministically) than a persistent
-/// worker-pool/queue, at the cost of some throughput if runtimes are very
-/// uneven within a chunk - an acceptable trade since correctness/safety, not
-/// peak throughput, is what bounding concurrency is for here.
+/// A fixed pool of `max_concurrency` worker threads share one backlog: each
+/// worker atomically claims the next unclaimed index into `dirs`
+/// (`next_index.fetch_add`), runs it, and immediately claims another -
+/// there's no "chunk boundary" where an idle worker sits waiting for
+/// slower siblings before more work becomes available. `dirs` itself needs
+/// no locking since it's only ever read; `next_index` is the only thing
+/// workers contend on, and that's a single atomic increment.
 ///
-/// Uses `thread::scope` rather than wrapping `work` in an `Arc`: each
-/// chunk's scope blocks until every thread spawned inside it has finished,
-/// so borrowing `work` and `dir` for the scope's duration is sound without
-/// any shared-ownership bookkeeping.
+/// A directory's `work` call is wrapped in `catch_unwind` so a panic ends
+/// only that directory's turn, not the worker thread itself - unlike the
+/// previous one-thread-per-directory design, a worker here goes on to
+/// claim further directories over its lifetime, so without this a panic
+/// would take an entire worker (not just one directory) out of rotation
+/// for the rest of the run. `AssertUnwindSafe` is required because `F` is
+/// generic and the compiler can't otherwise prove closures built from it
+/// are unwind-safe; this holds for every `work` this function is actually
+/// called with, since none of them leave shared state broken on panic -
+/// `process::run_command` (the real `work`) already reports its own
+/// per-directory errors without panicking, and the closures in this
+/// module's tests only touch atomics, which tolerate being read after a
+/// panicked write.
 fn run_bounded<F>(
     dirs: &[PathBuf],
     max_concurrency: usize,
@@ -129,23 +176,31 @@ fn run_bounded<F>(
 where
     F: Fn(&Path) -> bool + Sync,
 {
-    let mut results = Vec::with_capacity(dirs.len());
-    for chunk in dirs.chunks(max_concurrency.max(1)) {
-        thread::scope(|scope| {
-            let handles: Vec<_> = chunk
-                .iter()
-                .map(|dir| {
-                    let dir_display = dir.display().to_string();
-                    (dir_display, scope.spawn(|| work(dir)))
-                })
-                .collect();
-
-            for (dir_display, handle) in handles {
-                results.push((dir_display, handle.join()));
-            }
-        });
+    if dirs.is_empty() {
+        return Vec::new();
     }
-    results
+
+    let worker_count = max_concurrency.max(1).min(dirs.len());
+    let next_index = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::with_capacity(dirs.len()));
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| {
+                loop {
+                    let i = next_index.fetch_add(1, Ordering::SeqCst);
+                    let Some(dir) = dirs.get(i) else {
+                        break;
+                    };
+                    let dir_display = dir.display().to_string();
+                    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| work(dir)));
+                    results.lock().unwrap().push((dir_display, outcome));
+                }
+            });
+        }
+    });
+
+    results.into_inner().unwrap()
 }
 
 /// Reduces each directory's outcome (`Ok(success)`, or `Err(panic payload)`
@@ -219,6 +274,7 @@ fn resolve_timeout(instance: &ParsedArgs, config: &Config) -> Option<Duration> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::time::Instant;
 
     fn instance_with_options(options: &[(&str, &[&str])]) -> ParsedArgs {
         ParsedArgs {
@@ -359,6 +415,27 @@ mod tests {
     }
 
     #[test]
+    fn sync_flag_selects_sync_execution_mode() {
+        let instance = instance_with_options(&[("sync", &[])]);
+        assert_eq!(resolve_execution_mode(&instance), ExecutionMode::Sync);
+    }
+
+    #[test]
+    fn sync_flag_wins_over_a_concurrency_flag() {
+        let instance = instance_with_options(&[("sync", &[]), ("concurrency", &["8"])]);
+        assert_eq!(resolve_execution_mode(&instance), ExecutionMode::Sync);
+    }
+
+    #[test]
+    fn without_sync_resolves_to_concurrent_mode() {
+        let instance = instance_with_options(&[("concurrency", &["3"])]);
+        assert_eq!(
+            resolve_execution_mode(&instance),
+            ExecutionMode::Concurrent(3)
+        );
+    }
+
+    #[test]
     fn run_bounded_never_exceeds_the_configured_limit() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -404,13 +481,133 @@ mod tests {
 
     #[test]
     fn run_bounded_propagates_directory_results() {
+        // With a shared backlog rather than fixed batches, results are no
+        // longer guaranteed to come back in input order (two workers can
+        // finish in either order) - match each directory's outcome by name
+        // instead of asserting a fixed result sequence.
         let dirs: Vec<PathBuf> = vec![PathBuf::from("ok"), PathBuf::from("bad")];
         let results = run_bounded(&dirs, 2, |dir| dir.to_string_lossy() != "bad");
 
-        let outcomes: Vec<bool> = results
+        let mut outcomes: HashMap<String, bool> = results
             .into_iter()
-            .map(|(_, result)| result.unwrap())
+            .map(|(dir, result)| (dir, result.unwrap()))
             .collect();
-        assert_eq!(outcomes, vec![true, false]);
+        assert_eq!(outcomes.remove("ok"), Some(true));
+        assert_eq!(outcomes.remove("bad"), Some(false));
+        assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn run_bounded_isolates_a_panic_to_its_own_directory() {
+        // Regression test for the persistent-worker redesign: a worker
+        // thread now handles many directories over its lifetime instead of
+        // exactly one, so a panic inside `work` must not take the rest of
+        // that worker's future directories down with it.
+        let dirs: Vec<PathBuf> = (0..6).map(|i| PathBuf::from(format!("dir-{i}"))).collect();
+
+        let results = run_bounded(&dirs, 2, |dir| {
+            if dir.to_string_lossy() == "dir-3" {
+                panic!("boom");
+            }
+            true
+        });
+
+        assert_eq!(results.len(), 6);
+        let mut succeeded = 0;
+        let mut panicked = 0;
+        for (_, result) in results {
+            match result {
+                Ok(true) => succeeded += 1,
+                Ok(false) => panic!("no directory in this test returns false"),
+                Err(_) => panicked += 1,
+            }
+        }
+        assert_eq!(succeeded, 5);
+        assert_eq!(panicked, 1);
+    }
+
+    #[test]
+    fn run_bounded_never_spawns_more_workers_than_directories() {
+        // Requesting more concurrency than there is work must not spawn
+        // idle worker threads for directories that don't exist.
+        let dirs: Vec<PathBuf> = vec![PathBuf::from("only-one")];
+        let results = run_bounded(&dirs, 8, |_dir| true);
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn run_bounded_handles_empty_input() {
+        let results = run_bounded(&[], 4, |_dir| true);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn run_bounded_drains_fast_directories_while_a_slow_one_is_still_running() {
+        // Regression test for the shared-backlog redesign: directories used
+        // to be split into fixed-size chunks, and the next chunk only
+        // started once every thread in the current one finished - a single
+        // slow directory sharing a chunk with a fast one held up not just
+        // its own chunk but every later chunk's start too. With chunk size
+        // 2, [slow, fast-0] would be the first chunk; the other 19 fast
+        // directories couldn't even *start* until slow's chunk finished.
+        //
+        // This used to assert a wall-clock threshold instead of blocking
+        // deterministically, which was flaky on loaded/shared CI runners
+        // (a slower runner just makes every duration bigger, including the
+        // "should be fast" side, without proving anything about scheduling
+        // order). Blocking "slow" on a channel until the test explicitly
+        // releases it makes the property directly observable instead of
+        // inferred from timing: every fast directory must complete while
+        // slow is still outstanding, however long that takes on this
+        // particular machine.
+        use std::sync::mpsc;
+
+        let mut dirs = vec![PathBuf::from("slow")];
+        dirs.extend((0..20).map(|i| PathBuf::from(format!("fast-{i}"))));
+
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let fast_completed = AtomicUsize::new(0);
+
+        thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                run_bounded(&dirs, 2, |dir| {
+                    if dir.to_string_lossy() == "slow" {
+                        release_rx.lock().unwrap().recv().unwrap();
+                    } else {
+                        fast_completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    true
+                })
+            });
+
+            // Wait for every fast directory to finish, with a generous
+            // ceiling as a safety net against a genuine deadlock rather
+            // than a tight race against scheduling speed: under the old
+            // chunked scheduler this would never reach 20 (only the one
+            // fast directory sharing a chunk with "slow" could complete).
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fast_completed.load(Ordering::SeqCst) < 20 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let observed = fast_completed.load(Ordering::SeqCst);
+
+            // Release "slow" - and join the scheduler - *before* asserting,
+            // whether or not the check above is about to fail. `slow` is
+            // still blocked on `release_rx` regardless of how many fast
+            // directories completed, and `thread::scope` can't unwind past
+            // `handle` (still running, waiting on that same block) until
+            // it's actually finished; asserting first would deadlock the
+            // whole test on failure instead of reporting it.
+            release_tx.send(()).unwrap();
+            let results = handle.join().unwrap();
+
+            assert_eq!(
+                observed, 20,
+                "expected every fast directory to complete while the slow \
+                 one was still blocked, not stuck waiting on its chunk"
+            );
+            assert_eq!(results.len(), 21);
+        });
     }
 }
