@@ -302,3 +302,80 @@ fn fep_only_matches_directory_name_not_parent_path_component() {
          the parent path, got:\n{stdout}"
     );
 }
+
+#[test]
+fn fep_preserves_a_quoted_multi_word_argument() {
+    // Regression test for the argument-quoting bug: `instance.payload.join("
+    // ")` used to rebuild the shell command line by rejoining already-split
+    // argv elements with a plain space, so a quoted argument like the
+    // commit message below (one argv element because it was quoted) turned
+    // into three unquoted words once handed to the sub-shell - git happily
+    // interpreted "my" and "message" as pathspecs instead of part of the
+    // message, and the commit silently failed.
+    let workspace = tempfile::tempdir().unwrap();
+    let repo = workspace.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    std::fs::write(repo.join("f.txt"), "x").unwrap();
+    git(&["add", "f.txt"]);
+    git(&[
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=test",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+    ]);
+    std::fs::write(repo.join("f.txt"), "y").unwrap();
+    git(&["add", "f.txt"]);
+
+    let output = rat()
+        .args([
+            "fep",
+            "git",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=test",
+            "commit",
+            "-m",
+            "fix: my message",
+            "--local",
+        ])
+        .current_dir(workspace.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "rat fep exited non-zero: stdout={}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let log = Command::new("git")
+        .args(["log", "-1", "--format=%s"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let subject = String::from_utf8_lossy(&log.stdout);
+    assert_eq!(
+        subject.trim(),
+        "fix: my message",
+        "commit message was mangled - quoting was lost when rat rebuilt the \
+         command line"
+    );
+}
