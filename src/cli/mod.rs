@@ -11,6 +11,7 @@ const VALID_OPTIONS: &[&str] = &[
     "timeout",
     "all",
     "concurrency",
+    "sync",
 ];
 
 #[derive(Debug, Default, PartialEq)]
@@ -101,6 +102,15 @@ mod tests {
     fn bare_flag_has_no_values() {
         let parsed = parse_instance(&args(&["--local"]));
         assert_eq!(parsed.options.get("local"), Some(&vec![]));
+    }
+
+    #[test]
+    fn sync_flag_is_recognized() {
+        // Guards against `--sync` being silently dropped as an unrecognized
+        // flag (the fate of any option not listed in VALID_OPTIONS) if it's
+        // ever removed from that list without a test noticing.
+        let parsed = parse_instance(&args(&["--sync"]));
+        assert_eq!(parsed.options.get("sync"), Some(&vec![]));
     }
 
     #[test]

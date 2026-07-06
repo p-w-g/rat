@@ -1,3 +1,4 @@
+use super::execution_mode::ExecutionMode;
 use crate::cli::filter::FilterExpression;
 use crate::cli::{ParsedArgs, dirs};
 use crate::config::{self, Config};
@@ -76,12 +77,28 @@ pub fn run_parallel(instance: &ParsedArgs) -> bool {
     let command = instance.payload.join(" ");
     let sustain = instance.options.contains_key("sustain");
     let timeout = resolve_timeout(instance, &config);
-    let max_concurrency = resolve_concurrency(instance);
+    let execution_mode = resolve_execution_mode(instance);
 
-    let results = run_bounded(&available_dirs, max_concurrency, |dir| {
+    let results = run_bounded(&available_dirs, execution_mode.concurrency_limit(), |dir| {
         process::run_command(&command, dir, sustain, timeout)
     });
     aggregate(results)
+}
+
+/// Determines whether this run is sequential (`--sync`) or bounded-parallel.
+/// `--sync` always wins over `--concurrency`: forcing the same scheduler
+/// (`run_bounded`) down to a limit of 1 keeps one code path responsible for
+/// ordering/joining directories regardless of which mode is active, rather
+/// than duplicating a separate "run one at a time" loop.
+fn resolve_execution_mode(instance: &ParsedArgs) -> ExecutionMode {
+    if instance.options.contains_key("sync") {
+        if instance.options.contains_key("concurrency") {
+            println!("Ignoring --concurrency: --sync forces one directory at a time.");
+        }
+        return ExecutionMode::Sync;
+    }
+
+    ExecutionMode::Concurrent(resolve_concurrency(instance))
 }
 
 /// Determines how many directories may run at once. An explicit
@@ -358,6 +375,27 @@ mod tests {
     fn resolve_concurrency_falls_back_to_default_when_flag_absent() {
         let instance = instance_with_options(&[]);
         assert_eq!(resolve_concurrency(&instance), default_concurrency());
+    }
+
+    #[test]
+    fn sync_flag_selects_sync_execution_mode() {
+        let instance = instance_with_options(&[("sync", &[])]);
+        assert_eq!(resolve_execution_mode(&instance), ExecutionMode::Sync);
+    }
+
+    #[test]
+    fn sync_flag_wins_over_a_concurrency_flag() {
+        let instance = instance_with_options(&[("sync", &[]), ("concurrency", &["8"])]);
+        assert_eq!(resolve_execution_mode(&instance), ExecutionMode::Sync);
+    }
+
+    #[test]
+    fn without_sync_resolves_to_concurrent_mode() {
+        let instance = instance_with_options(&[("concurrency", &["3"])]);
+        assert_eq!(
+            resolve_execution_mode(&instance),
+            ExecutionMode::Concurrent(3)
+        );
     }
 
     #[test]
