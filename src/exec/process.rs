@@ -74,10 +74,20 @@ fn shell_command(command: &str) -> Command {
     cmd
 }
 
+/// On Unix, the spawned shell is put into its own new process group (see
+/// `kill_process_tree`'s doc comment for why). Note this is a deliberate
+/// trade-off: it also means an interactive Ctrl-C at the terminal, which
+/// signals only the terminal's foreground process group, no longer reaches
+/// this shell or its descendants the way it would if they shared rat's own
+/// group - the same group-isolation that lets us clean up a whole tree on
+/// timeout means rat itself has to be the one to do that cleanup, rather
+/// than relying on the terminal to signal everything at once.
 #[cfg(not(target_os = "windows"))]
 fn shell_command(command: &str) -> Command {
+    use std::os::unix::process::CommandExt;
     let mut cmd = Command::new("/bin/bash");
     cmd.arg("-c").arg(command);
+    cmd.process_group(0);
     cmd
 }
 
@@ -121,7 +131,7 @@ fn run_command_inner(
 
     if !exited {
         let duration = effective_timeout.expect("timeout branch implies Some");
-        child.kill()?;
+        kill_process_tree(&mut child);
         let _ = child.wait();
         return Ok(Outcome {
             success: false,
@@ -153,6 +163,45 @@ fn run_command_inner(
         success: status.success(),
         body,
     })
+}
+
+/// Kills `child` and, as best as the platform allows, everything it spawned
+/// - not just the shell process itself.
+///
+/// `child.kill()` alone only terminates the direct child (`bash`/`cmd.exe`);
+/// anything *that* process forked (a build tool, a nested `ping`, ...) is
+/// left running, orphaned, once the shell dies. A `--timeout` that only
+/// kills the wrapper defeats its own purpose for any non-trivial command,
+/// since the actual work can keep consuming CPU/network/disk indefinitely
+/// after rat has already reported the directory as timed out and moved on.
+///
+/// - Unix: `shell_command` puts the shell in its own new process group
+///   (`process_group(0)`), which any descendants it forks inherit by
+///   default; shelling out to `kill -KILL -<pgid>` (negative pid = "the
+///   whole group") reaches all of them without touching rat's own group.
+/// - Windows: `taskkill /T` walks the same parent-child tree Windows
+///   already tracks for every process, so no equivalent setup is needed at
+///   spawn time.
+///
+/// Both shell out to a standard OS utility rather than using raw
+/// FFI/job-object APIs, keeping this dependency- and unsafe-free; a failed
+/// kill attempt (e.g. the process already exited) is not itself an error
+/// here; whatever remains is caught by the `child.wait()` right after.
+#[cfg(not(target_os = "windows"))]
+fn kill_process_tree(child: &mut std::process::Child) {
+    let pid = child.id();
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{pid}"))
+        .status();
+}
+
+#[cfg(target_os = "windows")]
+fn kill_process_tree(child: &mut std::process::Child) {
+    let pid = child.id();
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .output();
 }
 
 /// std::process::Child has no built-in timed wait, so poll try_wait() at a
@@ -206,6 +255,59 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     fn sleep_command(seconds: u32) -> String {
         format!("sleep {seconds}")
+    }
+
+    /// A command whose *direct* child (the shell) finishes almost instantly,
+    /// but which itself waits on a backgrounded grandchild that sleeps
+    /// briefly and then writes `marker`. This mirrors what killing only the
+    /// wrapping shell used to leave behind: a grandchild process that isn't
+    /// a direct child of the timed-out process. If the marker exists after
+    /// waiting well past the grandchild's own sleep, it survived the kill.
+    #[cfg(target_os = "windows")]
+    fn background_grandchild_then_touch(marker: &std::path::Path) -> String {
+        format!(
+            "start /B /WAIT cmd /c \"ping -n 5 127.0.0.1 > nul && echo done > {}\"",
+            marker.display()
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn background_grandchild_then_touch(marker: &std::path::Path) -> String {
+        format!("(sleep 0.5 && touch '{}') & wait", marker.display())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn grandchild_settle_time() -> Duration {
+        Duration::from_secs(5)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn grandchild_settle_time() -> Duration {
+        Duration::from_millis(700)
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_tree_not_just_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+
+        let success = run_command(
+            &background_grandchild_then_touch(&marker),
+            dir.path(),
+            false,
+            Some(Duration::from_millis(200)),
+        );
+        assert!(!success);
+
+        // Give the grandchild more time than its own sleep needs; if
+        // killing only reached the direct shell (the pre-fix behavior),
+        // the grandchild keeps running in the background and eventually
+        // writes the marker anyway, well after rat has already returned.
+        thread::sleep(grandchild_settle_time());
+        assert!(
+            !marker.exists(),
+            "a grandchild process survived the timeout and wrote its marker file"
+        );
     }
 
     #[test]
