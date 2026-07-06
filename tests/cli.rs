@@ -211,14 +211,30 @@ fn fep_directory_reports_are_not_interleaved() {
             .split_once("' in ")
             .expect("header is \"<command>' in <path>\"");
 
+        // Compare by directory *name*, not the full path string: on macOS,
+        // `/var` is a symlink to `/private/var`, and `std::env::current_dir()`
+        // (used internally for `--local`) returns the OS-resolved form
+        // (`/private/var/folders/.../alpha`) while `tempfile::tempdir()`
+        // hands back the unresolved form (`/var/folders/.../alpha`) - the
+        // same real directory, but two different strings. A full-string
+        // comparison here would never recognize "this block's own
+        // directory" as matching itself, falsely treating it as some
+        // *other* labeled directory and reporting a false interleaving
+        // failure (the resolved path trivially contains the unresolved one
+        // as a trailing substring).
+        let this_label = std::path::Path::new(this_dir)
+            .file_name()
+            .and_then(|n| n.to_str());
+
         for label in labels {
-            let other_dir = dir.path().join(label).display().to_string();
-            if other_dir != this_dir {
-                assert!(
-                    !block.contains(&other_dir),
-                    "report for {this_dir} unexpectedly mentions {other_dir} - reports are interleaved:\n{stdout}"
-                );
+            if this_label == Some(label) {
+                continue;
             }
+            let other_dir = dir.path().join(label).display().to_string();
+            assert!(
+                !block.contains(&other_dir),
+                "report for {this_dir} unexpectedly mentions {other_dir} - reports are interleaved:\n{stdout}"
+            );
         }
     }
 }
