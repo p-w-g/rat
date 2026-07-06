@@ -1,4 +1,5 @@
 pub mod dirs;
+pub mod filter;
 
 use std::collections::HashMap;
 

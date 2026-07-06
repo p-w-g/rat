@@ -1,3 +1,4 @@
+use crate::cli::filter::FilterExpression;
 use crate::cli::{ParsedArgs, dirs};
 use crate::config::{self, Config};
 use crate::exec::process;
@@ -56,11 +57,12 @@ pub fn run_parallel(instance: &ParsedArgs) -> bool {
         dirs::assume_working_directory(local_flag, config.default_folder.as_deref());
 
     let ignored = config.ignored_folders.as_deref();
-    let skip = instance.options.get("skip").map(Vec::as_slice);
-    let only = instance.options.get("only").map(Vec::as_slice);
+    let filter = FilterExpression::new(
+        instance.options.get("only").map(Vec::as_slice),
+        instance.options.get("skip").map(Vec::as_slice),
+    );
 
-    let available_dirs = match dirs::available_directories(&working_directory, ignored, skip, only)
-    {
+    let available_dirs = match dirs::available_directories(&working_directory, ignored, &filter) {
         Ok(dirs) => dirs,
         Err(e) => {
             println!(
