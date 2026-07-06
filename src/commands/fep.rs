@@ -2,7 +2,7 @@ use super::execution_mode::ExecutionMode;
 use crate::cli::filter::FilterExpression;
 use crate::cli::{ParsedArgs, dirs};
 use crate::config::{self, Config};
-use crate::exec::process;
+use crate::exec::{process, quoting};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -74,7 +74,7 @@ pub fn run_parallel(instance: &ParsedArgs) -> bool {
         }
     };
 
-    let command = instance.payload.join(" ");
+    let command = quoting::build_command_line(&instance.payload);
     let sustain = instance.options.contains_key("sustain");
     let timeout = resolve_timeout(instance, &config);
     let execution_mode = resolve_execution_mode(instance);
