@@ -542,46 +542,72 @@ mod tests {
     }
 
     #[test]
-    fn run_bounded_lets_a_free_worker_pick_up_the_next_directory_immediately() {
+    fn run_bounded_drains_fast_directories_while_a_slow_one_is_still_running() {
         // Regression test for the shared-backlog redesign: directories used
         // to be split into fixed-size chunks, and the next chunk only
         // started once every thread in the current one finished - a single
         // slow directory sharing a chunk with a fast one held up not just
-        // its own chunk but every later chunk's start too. Now a free
-        // worker immediately claims the next unclaimed directory, so 20
-        // fast directories running alongside one slow one (with a second
-        // worker free to drain them) finish in roughly the slower of "the
-        // one slow directory" and "20 fast ones run back-to-back by one
-        // worker" - not "slow" plus several additional chunk-rounds of fast
-        // ones serialized behind it on top of that.
+        // its own chunk but every later chunk's start too. With chunk size
+        // 2, [slow, fast-0] would be the first chunk; the other 19 fast
+        // directories couldn't even *start* until slow's chunk finished.
         //
-        // With chunk size 2: [slow, fast] pairs the slow directory with one
-        // fast one (~400ms for that chunk), then the remaining 19 fast
-        // directories still need 10 more chunk-rounds (~15ms each) *after*
-        // that ~400ms, landing around 550ms+. The shared-backlog version
-        // instead has one worker occupied by the slow directory for 400ms
-        // while the other worker drains all 20 fast directories
-        // (~20 * 15ms = 300ms) in parallel, finishing around 400-450ms.
+        // This used to assert a wall-clock threshold instead of blocking
+        // deterministically, which was flaky on loaded/shared CI runners
+        // (a slower runner just makes every duration bigger, including the
+        // "should be fast" side, without proving anything about scheduling
+        // order). Blocking "slow" on a channel until the test explicitly
+        // releases it makes the property directly observable instead of
+        // inferred from timing: every fast directory must complete while
+        // slow is still outstanding, however long that takes on this
+        // particular machine.
+        use std::sync::mpsc;
+
         let mut dirs = vec![PathBuf::from("slow")];
         dirs.extend((0..20).map(|i| PathBuf::from(format!("fast-{i}"))));
 
-        let start = Instant::now();
-        let results = run_bounded(&dirs, 2, |dir| {
-            let sleep = if dir.to_string_lossy() == "slow" {
-                Duration::from_millis(400)
-            } else {
-                Duration::from_millis(15)
-            };
-            thread::sleep(sleep);
-            true
-        });
-        let elapsed = start.elapsed();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let fast_completed = AtomicUsize::new(0);
 
-        assert_eq!(results.len(), 21);
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "expected the fast directories to finish alongside the slow one \
-             rather than serialized behind chunk boundaries, took {elapsed:?}"
-        );
+        thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                run_bounded(&dirs, 2, |dir| {
+                    if dir.to_string_lossy() == "slow" {
+                        release_rx.lock().unwrap().recv().unwrap();
+                    } else {
+                        fast_completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                    true
+                })
+            });
+
+            // Wait for every fast directory to finish, with a generous
+            // ceiling as a safety net against a genuine deadlock rather
+            // than a tight race against scheduling speed: under the old
+            // chunked scheduler this would never reach 20 (only the one
+            // fast directory sharing a chunk with "slow" could complete).
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while fast_completed.load(Ordering::SeqCst) < 20 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            let observed = fast_completed.load(Ordering::SeqCst);
+
+            // Release "slow" - and join the scheduler - *before* asserting,
+            // whether or not the check above is about to fail. `slow` is
+            // still blocked on `release_rx` regardless of how many fast
+            // directories completed, and `thread::scope` can't unwind past
+            // `handle` (still running, waiting on that same block) until
+            // it's actually finished; asserting first would deadlock the
+            // whole test on failure instead of reporting it.
+            release_tx.send(()).unwrap();
+            let results = handle.join().unwrap();
+
+            assert_eq!(
+                observed, 20,
+                "expected every fast directory to complete while the slow \
+                 one was still blocked, not stuck waiting on its chunk"
+            );
+            assert_eq!(results.len(), 21);
+        });
     }
 }
