@@ -54,7 +54,25 @@ struct Outcome {
     body: String,
 }
 
-/// Builds the `Command` that runs `command` through the platform shell.
+/// Shells tried, in order, to run a command through. `/bin/bash` is the
+/// primary target (it's what `--word...`-style compound commands in the
+/// README/help text assume), but some minimal environments - notably
+/// musl/Alpine-based containers, common in CI - don't ship it at all,
+/// only a POSIX `/bin/sh`. Falling back to `/bin/sh` there still lets the
+/// documented, POSIX-portable use cases (`git pull`, `npm install`, `&&`
+/// chains) work instead of failing outright with "No such file or
+/// directory" on every single subdirectory.
+#[cfg(not(target_os = "windows"))]
+const SHELL_CANDIDATES: &[&str] = &["/bin/bash", "/bin/sh"];
+
+/// cmd.exe is a core, always-present Windows component, so there's no
+/// equivalent fallback concern here - kept as a one-element list so
+/// `spawn_shell` doesn't need a separate single-shell code path.
+#[cfg(target_os = "windows")]
+const SHELL_CANDIDATES: &[&str] = &["cmd.exe"];
+
+/// Builds the (not yet spawned) `Command` that runs `command` through
+/// `shell`.
 ///
 /// On Windows this deliberately uses `raw_arg` instead of `arg`/`args` for
 /// the command text: `Command::arg` applies Rust's own Windows
@@ -66,9 +84,9 @@ struct Outcome {
 /// cmd.exe (and, in turn, whatever program it invokes) does its own
 /// parsing of that text, not Rust's.
 #[cfg(target_os = "windows")]
-fn shell_command(command: &str) -> Command {
+fn build_shell_command(shell: &str, command: &str) -> Command {
     use std::os::windows::process::CommandExt;
-    let mut cmd = Command::new("cmd.exe");
+    let mut cmd = Command::new(shell);
     cmd.arg("/c");
     cmd.raw_arg(command);
     cmd
@@ -83,12 +101,38 @@ fn shell_command(command: &str) -> Command {
 /// timeout means rat itself has to be the one to do that cleanup, rather
 /// than relying on the terminal to signal everything at once.
 #[cfg(not(target_os = "windows"))]
-fn shell_command(command: &str) -> Command {
+fn build_shell_command(shell: &str, command: &str) -> Command {
     use std::os::unix::process::CommandExt;
-    let mut cmd = Command::new("/bin/bash");
+    let mut cmd = Command::new(shell);
     cmd.arg("-c").arg(command);
     cmd.process_group(0);
     cmd
+}
+
+/// Tries each shell in `candidates`, in order, spawning `command` in
+/// `working_directory` through the first one that actually exists.
+/// Candidates are only skipped on `NotFound` (the shell binary itself is
+/// missing) - any other spawn error (permissions, ...) is reported as-is
+/// rather than masked by trying further candidates.
+fn spawn_shell(
+    command: &str,
+    working_directory: &Path,
+    candidates: &[&str],
+) -> std::io::Result<std::process::Child> {
+    let mut last_err = None;
+    for shell in candidates {
+        let result = build_shell_command(shell, command)
+            .current_dir(working_directory)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        match result {
+            Ok(child) => return Ok(child),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => last_err = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.expect("SHELL_CANDIDATES is never empty"))
 }
 
 fn run_command_inner(
@@ -97,11 +141,7 @@ fn run_command_inner(
     sustain: bool,
     timeout: Option<Duration>,
 ) -> std::io::Result<Outcome> {
-    let mut child = shell_command(command)
-        .current_dir(working_directory)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = spawn_shell(command, working_directory, SHELL_CANDIDATES)?;
 
     // Read stdout/stderr on their own threads as the process runs, the same
     // way the original kicked off ReadToEndAsync before waiting - otherwise
@@ -249,6 +289,35 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> std:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    const MISSING_SHELL: &str = "definitely-not-a-real-shell-xyz.exe";
+    #[cfg(not(target_os = "windows"))]
+    const MISSING_SHELL: &str = "/definitely/not/a/real/shell-xyz";
+
+    #[cfg(target_os = "windows")]
+    const REAL_SHELL: &str = "cmd.exe";
+    #[cfg(not(target_os = "windows"))]
+    const REAL_SHELL: &str = "/bin/sh";
+
+    #[test]
+    fn falls_back_to_the_next_candidate_when_the_first_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = spawn_shell(
+            &echo_command("hi"),
+            dir.path(),
+            &[MISSING_SHELL, REAL_SHELL],
+        )
+        .unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn errors_when_every_candidate_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = spawn_shell(&echo_command("hi"), dir.path(), &[MISSING_SHELL]);
+        assert!(result.is_err());
+    }
 
     #[cfg(target_os = "windows")]
     fn echo_command(text: &str) -> String {
