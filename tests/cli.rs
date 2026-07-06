@@ -398,3 +398,27 @@ fn fep_never_runs_inside_a_dot_git_directory() {
     assert!(stdout.contains(&dir.path().join("repo-a").display().to_string()));
     assert!(!stdout.contains(&dir.path().join(".git").display().to_string()));
 }
+
+#[test]
+fn fep_reports_when_no_subdirectories_match() {
+    // Regression test: a working folder with nothing to run in (empty, or
+    // everything filtered out) used to print nothing at all and exit 0,
+    // indistinguishable from "ran successfully everywhere" - a real risk in
+    // CI/scripting, this tool's primary use case, where a misconfigured
+    // --only or wrong working folder would go unnoticed.
+    let dir = tempfile::tempdir().unwrap();
+
+    let output = rat()
+        .args(["fep", "echo", "marker", "--local"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No matching subdirectories"),
+        "expected a message about no matching subdirectories, got:\n{stdout}"
+    );
+    assert!(!stdout.contains("Running 'echo marker'"));
+}

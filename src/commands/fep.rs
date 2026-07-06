@@ -74,6 +74,15 @@ pub fn run_parallel(instance: &ParsedArgs) -> bool {
         }
     };
 
+    if available_dirs.is_empty() {
+        println!(
+            "No matching subdirectories found in {} (after ignore/--only/--skip filtering) - \
+             nothing to run.",
+            working_directory.display()
+        );
+        return true;
+    }
+
     let command = quoting::build_command_line(&instance.payload);
     let sustain = instance.options.contains_key("sustain");
     let timeout = resolve_timeout(instance, &config);
