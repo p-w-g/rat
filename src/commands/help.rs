@@ -24,11 +24,16 @@ Available commands:
                                           default folder is configured
                       --concurrency-4     run at most 4 directories at once
                                           (default: number of CPUs)
-                      --only-a-b-c        only run in subfolders whose path
-                                          contains "a", "b", or "c"
-                      --skip-a-b-c        skip subfolders whose path contains
-                                          "a", "b", or "c" (ignored entirely
-                                          if --only is also given)
+                      --only-uk-fi        only run in subfolders that have
+                                          "uk" or "fi" as a "-"-separated
+                                          name component (also accepts
+                                          --only-uk,fi)
+                      --skip-priv-corp    skip subfolders that have "priv"
+                                          or "corp" as a name component;
+                                          combines with --only instead of
+                                          being ignored by it - a folder
+                                          must satisfy --only (if given)
+                                          AND not match --skip (if given)
                       --sustain           wait as long as it takes, ignoring
                                           any timeout
                       --timeout-30        timeout this run after 30 seconds,

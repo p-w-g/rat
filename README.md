@@ -80,14 +80,43 @@ once per immediate subdirectory of the working folder, in parallel.
 | --------------------- | ------------------------------------------------------------------------------------------------- |
 | `--local`              | use the current directory for this run, even if a default folder is set via `cfg here`            |
 | `--concurrency-4`      | run at most 4 directories at once (default: number of CPUs)                                        |
-| `--only-a-b-c`         | only run in subfolders whose path contains `a`, `b`, or `c`                                        |
-| `--skip-a-b-c`         | skip subfolders whose path contains `a`, `b`, or `c` (ignored entirely if `--only` is also given)  |
+| `--only-uk-fi`         | only run in subfolders that have `uk` or `fi` as a `-`-separated name component                    |
+| `--skip-priv-corp`     | skip subfolders that have `priv` or `corp` as a name component (combines with `--only`, see below)  |
 | `--sustain`            | wait as long as it takes, ignoring any timeout                                                     |
 | `--timeout-30`         | timeout *this run* after 30 seconds, overriding the configured timeout                             |
 
 > `--timeout-0` is a **0-second timeout**, not "disabled" - that's different
 > from `cfg to 0`, which does disable it. Use `--sustain` or `cfg nto` if you
 > want no timeout.
+
+### `--only`/`--skip`: component-aware directory matching
+
+A subfolder's name is split into components on `-` (e.g. `uk-priv-app`
+tokenizes to `uk`, `priv`, `app`); `--only`/`--skip` match whole components,
+not an arbitrary substring of the folder's path. Given
+
+```
+uk-priv-app  uk-corp-app  fi-priv-app  fi-corp-app  nl-priv-app  at-corp-app
+```
+
+| flag                        | selects                                    |
+| ---------------------------- | ------------------------------------------- |
+| `--only-uk`                  | `uk-priv-app`, `uk-corp-app`                |
+| `--only-app`                 | all six (`app` is a component of every one) |
+| `--only-corp`                | every corporate app                         |
+| `--skip-priv`                | everything except the private apps          |
+| `--only-uk --skip-corp`      | `uk-priv-app`                               |
+| `--only-app --skip-fi`       | every app except the Finnish ones           |
+
+`--only` and `--skip` **both apply when given**: a folder must satisfy
+`--only` (if present) *and* not match `--skip` (if present). A single flag
+can also list multiple components as comma- or dash-separated values (OR
+within that flag): `--only-uk,fi` and `--only-uk-fi` both mean "UK or FI".
+
+> Earlier versions matched by substring against a subfolder's full path (so
+> a filter word appearing in a parent folder could match every subfolder),
+> and `--skip` was ignored entirely whenever `--only` was also given. Both
+> of those have changed to the component-aware, combining behavior above.
 
 ### The #1 gotcha: your command's flags vs. rat's flags
 
