@@ -24,6 +24,10 @@ Available commands:
                                           default folder is configured
                       --concurrency-4     run at most 4 directories at once
                                           (default: number of CPUs)
+                      --sync              run exactly one directory at a
+                                          time (like --concurrency-1, but
+                                          says what you mean); wins over
+                                          --concurrency if both are given
                       --only-uk-fi        only run in subfolders that have
                                           "uk" or "fi" as a "-"-separated
                                           name component (also accepts
@@ -44,8 +48,9 @@ Available commands:
 
                     IMPORTANT: rat parses these flags out of <<command>>
                     itself, before your command ever runs. Any `--word...`
-                    you pass that starts with local/skip/only/sustain/timeout
-                    is captured by rat instead of reaching your command, and
+                    you pass that starts with
+                    local/skip/only/sustain/timeout/sync is captured by rat
+                    instead of reaching your command, and
                     any other unrecognized `--flag` is silently dropped
                     rather than forwarded. So:
 

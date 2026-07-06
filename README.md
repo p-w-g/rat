@@ -80,6 +80,7 @@ once per immediate subdirectory of the working folder, in parallel.
 | --------------------- | ------------------------------------------------------------------------------------------------- |
 | `--local`              | use the current directory for this run, even if a default folder is set via `cfg here`            |
 | `--concurrency-4`      | run at most 4 directories at once (default: number of CPUs)                                        |
+| `--sync`               | run exactly one directory at a time (equivalent to `--concurrency-1`); wins over `--concurrency` if both are given |
 | `--only-uk-fi`         | only run in subfolders that have `uk` or `fi` as a `-`-separated name component                    |
 | `--skip-priv-corp`     | skip subfolders that have `priv` or `corp` as a name component (combines with `--only`, see below)  |
 | `--sustain`            | wait as long as it takes, ignoring any timeout                                                     |
@@ -88,6 +89,16 @@ once per immediate subdirectory of the working folder, in parallel.
 > `--timeout-0` is a **0-second timeout**, not "disabled" - that's different
 > from `cfg to 0`, which does disable it. Use `--sustain` or `cfg nto` if you
 > want no timeout.
+
+### `--sync`: one directory at a time
+
+By default `fep` fans a command out to every subfolder at once. Use `--sync`
+when that's not safe for your workflow - e.g. "for every repo: checkout
+master, create a feature branch, make changes, commit, push" is the kind of
+multi-step, stateful sequence you generally want to run one repository at a
+time rather than in parallel. `--sync` runs exactly one directory at a time;
+it's equivalent to `--concurrency-1`, just with clearer intent at the call
+site (and it wins if you also pass `--concurrency`).
 
 ### `--only`/`--skip`: component-aware directory matching
 
@@ -124,8 +135,8 @@ rat parses `--flags` out of the command you pass to `fep` *before* your
 command ever runs - your shell doesn't get a say. Specifically:
 
 - Any `--word...` in your command where `word` is one of rat's reserved
-  words (`local`, `skip`, `only`, `sustain`, `timeout`) is captured by rat
-  as its own flag and **never reaches your command**.
+  words (`local`, `skip`, `only`, `sustain`, `timeout`, `sync`) is captured
+  by rat as its own flag and **never reaches your command**.
 - Any other unrecognized `--flag` is **silently dropped** - not passed to
   your command, not treated as a rat option, just gone.
 - Single-dash flags (`-m`, `-rf`, `-n`, ...) are **never** touched by rat and
