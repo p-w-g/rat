@@ -147,22 +147,47 @@ fn run_command_inner(
     let stdout_output = stdout_handle.join().unwrap_or_default();
     let stderr_output = stderr_handle.join().unwrap_or_default();
 
-    let body = if status.success() {
+    let outcome_line = if status.success() {
         format!(
-            "Command executed successfully in {}.\n{stdout_output}",
+            "Command executed successfully in {}.",
             working_directory.display()
         )
     } else {
         format!(
-            "Command failed gracefully in {}.\n{stderr_output}",
+            "Command failed gracefully in {}.",
             working_directory.display()
         )
     };
+
+    // Both streams are shown regardless of exit status: a command can write
+    // useful diagnostics to stdout right before failing, or warnings to
+    // stderr while still exiting 0 - previously only the "expected" stream
+    // for each outcome was kept and the other was silently discarded,
+    // losing exactly the output most useful for figuring out what happened.
+    let mut body = outcome_line;
+    append_stream(&mut body, "stdout:", &stdout_output);
+    append_stream(&mut body, "stderr:", &stderr_output);
 
     Ok(Outcome {
         success: status.success(),
         body,
     })
+}
+
+/// Appends a labeled section for `content` to `body`, unless `content` is
+/// empty - the common case of a command that only wrote to one stream
+/// shouldn't gain a dangling empty "stderr:" label.
+fn append_stream(body: &mut String, label: &str, content: &str) {
+    if content.is_empty() {
+        return;
+    }
+    body.push('\n');
+    body.push_str(label);
+    body.push('\n');
+    body.push_str(content);
+    if !content.ends_with('\n') {
+        body.push('\n');
+    }
 }
 
 /// Kills `child` and, as best as the platform allows, everything it spawned
@@ -236,6 +261,16 @@ mod tests {
     }
 
     #[cfg(target_os = "windows")]
+    fn success_writing_to_both_streams() -> String {
+        "echo out-line & echo err-line 1>&2".to_string()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn failure_writing_to_both_streams() -> String {
+        "echo out-line & echo err-line 1>&2 & exit 1".to_string()
+    }
+
+    #[cfg(target_os = "windows")]
     fn sleep_command(seconds: u32) -> String {
         // no built-in `sleep` in cmd.exe; ping is the standard workaround
         // and needs no interactive stdin, unlike `timeout`.
@@ -250,6 +285,16 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     fn failing_command_with_stderr(text: &str) -> String {
         format!("echo {text} 1>&2; exit 1")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn success_writing_to_both_streams() -> String {
+        "echo out-line && echo err-line 1>&2".to_string()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn failure_writing_to_both_streams() -> String {
+        "echo out-line && echo err-line 1>&2 && exit 1".to_string()
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -327,6 +372,32 @@ mod tests {
             None,
         );
         assert!(!success);
+    }
+
+    #[test]
+    fn stderr_is_still_reported_when_the_command_succeeds() {
+        // Regression test: a command can exit 0 while still writing
+        // diagnostics/warnings to stderr - those must not be silently
+        // dropped just because the overall command "succeeded".
+        let dir = tempfile::tempdir().unwrap();
+        let outcome =
+            run_command_inner(&success_writing_to_both_streams(), dir.path(), false, None).unwrap();
+        assert!(outcome.success);
+        assert!(outcome.body.contains("out-line"));
+        assert!(outcome.body.contains("err-line"));
+    }
+
+    #[test]
+    fn stdout_is_still_reported_when_the_command_fails() {
+        // Regression test: a command can print useful context to stdout
+        // right before failing - that must not be silently dropped just
+        // because the overall command "failed".
+        let dir = tempfile::tempdir().unwrap();
+        let outcome =
+            run_command_inner(&failure_writing_to_both_streams(), dir.path(), false, None).unwrap();
+        assert!(!outcome.success);
+        assert!(outcome.body.contains("out-line"));
+        assert!(outcome.body.contains("err-line"));
     }
 
     #[test]
