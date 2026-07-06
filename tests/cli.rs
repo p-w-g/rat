@@ -1,7 +1,43 @@
+use std::path::Path;
 use std::process::Command;
 
 fn rat() -> Command {
     Command::new(env!("CARGO_BIN_EXE_rat"))
+}
+
+/// Directories from the component-matching examples: two per country
+/// ("priv"/"corp"), all sharing an "app" suffix.
+const COUNTRY_APP_DIRS: &[&str] = &[
+    "uk-priv-app",
+    "uk-corp-app",
+    "fi-priv-app",
+    "fi-corp-app",
+    "nl-priv-app",
+    "at-corp-app",
+];
+
+fn create_dirs(root: &Path, names: &[&str]) {
+    for name in names {
+        std::fs::create_dir(root.join(name)).unwrap();
+    }
+}
+
+/// Runs `fep echo marker` with the given extra flags and returns the subset
+/// of `COUNTRY_APP_DIRS` that the run actually reported executing in.
+fn run_and_collect_matches(root: &Path, extra_flags: &[&str]) -> Vec<&'static str> {
+    let output = rat()
+        .args(["fep", "echo", "marker", "--local"])
+        .args(extra_flags)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    COUNTRY_APP_DIRS
+        .iter()
+        .copied()
+        .filter(|name| stdout.contains(&root.join(name).display().to_string()))
+        .collect()
 }
 
 #[test]
@@ -173,4 +209,96 @@ fn fep_directory_reports_are_not_interleaved() {
             }
         }
     }
+}
+
+#[test]
+fn fep_only_matches_a_directory_name_component() {
+    let dir = tempfile::tempdir().unwrap();
+    create_dirs(dir.path(), COUNTRY_APP_DIRS);
+
+    let mut matched = run_and_collect_matches(dir.path(), &["--only-uk"]);
+    matched.sort();
+    assert_eq!(matched, vec!["uk-corp-app", "uk-priv-app"]);
+}
+
+#[test]
+fn fep_only_component_shared_by_every_directory_selects_all_of_them() {
+    let dir = tempfile::tempdir().unwrap();
+    create_dirs(dir.path(), COUNTRY_APP_DIRS);
+
+    let mut matched = run_and_collect_matches(dir.path(), &["--only-app"]);
+    matched.sort();
+    let mut expected = COUNTRY_APP_DIRS.to_vec();
+    expected.sort();
+    assert_eq!(matched, expected);
+}
+
+#[test]
+fn fep_skip_excludes_a_directory_name_component() {
+    let dir = tempfile::tempdir().unwrap();
+    create_dirs(dir.path(), COUNTRY_APP_DIRS);
+
+    let mut matched = run_and_collect_matches(dir.path(), &["--skip-priv"]);
+    matched.sort();
+    assert_eq!(matched, vec!["at-corp-app", "fi-corp-app", "uk-corp-app"]);
+}
+
+#[test]
+fn fep_only_and_skip_combine_instead_of_skip_being_ignored() {
+    // Regression test for the redesigned --only/--skip interaction: skip
+    // used to be ignored entirely whenever only was also given. It now
+    // narrows the only-selected set instead.
+    let dir = tempfile::tempdir().unwrap();
+    create_dirs(dir.path(), COUNTRY_APP_DIRS);
+
+    let matched = run_and_collect_matches(dir.path(), &["--only-uk", "--skip-corp"]);
+    assert_eq!(matched, vec!["uk-priv-app"]);
+}
+
+#[test]
+fn fep_only_accepts_comma_separated_values_as_or() {
+    let dir = tempfile::tempdir().unwrap();
+    create_dirs(dir.path(), COUNTRY_APP_DIRS);
+
+    let mut matched = run_and_collect_matches(dir.path(), &["--only-uk,fi"]);
+    matched.sort();
+    assert_eq!(
+        matched,
+        vec!["fi-corp-app", "fi-priv-app", "uk-corp-app", "uk-priv-app"]
+    );
+}
+
+#[test]
+fn fep_skip_accepts_comma_separated_values_as_or() {
+    let dir = tempfile::tempdir().unwrap();
+    create_dirs(dir.path(), COUNTRY_APP_DIRS);
+
+    let mut matched = run_and_collect_matches(dir.path(), &["--only-app", "--skip-uk,nl"]);
+    matched.sort();
+    assert_eq!(matched, vec!["at-corp-app", "fi-corp-app", "fi-priv-app"]);
+}
+
+#[test]
+fn fep_only_matches_directory_name_not_parent_path_component() {
+    // A component matcher must judge each directory by its own name, not by
+    // substring search over its full path - a parent folder that happens to
+    // contain a filter word must not affect the result. Nest the fixture
+    // directories under a parent that shares a token with the filter.
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("uk-workspace");
+    std::fs::create_dir(&parent).unwrap();
+    create_dirs(&parent, &["api", "web"]);
+
+    let output = rat()
+        .args(["fep", "echo", "marker", "--local", "--only-uk"])
+        .current_dir(&parent)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !stdout.contains("Running 'echo marker'"),
+        "expected no directory to match a filter word that only appears in \
+         the parent path, got:\n{stdout}"
+    );
 }
