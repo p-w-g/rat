@@ -3,7 +3,10 @@ use crate::cli::filter::FilterExpression;
 use crate::cli::{ParsedArgs, dirs};
 use crate::config::{self, Config};
 use crate::exec::{process, quoting};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -144,17 +147,27 @@ fn resolve_concurrency(instance: &ParsedArgs) -> usize {
 /// Runs `work` once per directory, at most `max_concurrency` at a time, and
 /// returns each directory's display path paired with its outcome.
 ///
-/// Directories are processed in fixed-size chunks: the next chunk only
-/// starts once every thread in the current one has finished. That's simpler
-/// to reason about (and to test deterministically) than a persistent
-/// worker-pool/queue, at the cost of some throughput if runtimes are very
-/// uneven within a chunk - an acceptable trade since correctness/safety, not
-/// peak throughput, is what bounding concurrency is for here.
+/// A fixed pool of `max_concurrency` worker threads share one backlog: each
+/// worker atomically claims the next unclaimed index into `dirs`
+/// (`next_index.fetch_add`), runs it, and immediately claims another -
+/// there's no "chunk boundary" where an idle worker sits waiting for
+/// slower siblings before more work becomes available. `dirs` itself needs
+/// no locking since it's only ever read; `next_index` is the only thing
+/// workers contend on, and that's a single atomic increment.
 ///
-/// Uses `thread::scope` rather than wrapping `work` in an `Arc`: each
-/// chunk's scope blocks until every thread spawned inside it has finished,
-/// so borrowing `work` and `dir` for the scope's duration is sound without
-/// any shared-ownership bookkeeping.
+/// A directory's `work` call is wrapped in `catch_unwind` so a panic ends
+/// only that directory's turn, not the worker thread itself - unlike the
+/// previous one-thread-per-directory design, a worker here goes on to
+/// claim further directories over its lifetime, so without this a panic
+/// would take an entire worker (not just one directory) out of rotation
+/// for the rest of the run. `AssertUnwindSafe` is required because `F` is
+/// generic and the compiler can't otherwise prove closures built from it
+/// are unwind-safe; this holds for every `work` this function is actually
+/// called with, since none of them leave shared state broken on panic -
+/// `process::run_command` (the real `work`) already reports its own
+/// per-directory errors without panicking, and the closures in this
+/// module's tests only touch atomics, which tolerate being read after a
+/// panicked write.
 fn run_bounded<F>(
     dirs: &[PathBuf],
     max_concurrency: usize,
@@ -163,23 +176,31 @@ fn run_bounded<F>(
 where
     F: Fn(&Path) -> bool + Sync,
 {
-    let mut results = Vec::with_capacity(dirs.len());
-    for chunk in dirs.chunks(max_concurrency.max(1)) {
-        thread::scope(|scope| {
-            let handles: Vec<_> = chunk
-                .iter()
-                .map(|dir| {
-                    let dir_display = dir.display().to_string();
-                    (dir_display, scope.spawn(|| work(dir)))
-                })
-                .collect();
-
-            for (dir_display, handle) in handles {
-                results.push((dir_display, handle.join()));
-            }
-        });
+    if dirs.is_empty() {
+        return Vec::new();
     }
-    results
+
+    let worker_count = max_concurrency.max(1).min(dirs.len());
+    let next_index = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::with_capacity(dirs.len()));
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| {
+                loop {
+                    let i = next_index.fetch_add(1, Ordering::SeqCst);
+                    let Some(dir) = dirs.get(i) else {
+                        break;
+                    };
+                    let dir_display = dir.display().to_string();
+                    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| work(dir)));
+                    results.lock().unwrap().push((dir_display, outcome));
+                }
+            });
+        }
+    });
+
+    results.into_inner().unwrap()
 }
 
 /// Reduces each directory's outcome (`Ok(success)`, or `Err(panic payload)`
@@ -253,6 +274,7 @@ fn resolve_timeout(instance: &ParsedArgs, config: &Config) -> Option<Duration> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::time::Instant;
 
     fn instance_with_options(options: &[(&str, &[&str])]) -> ParsedArgs {
         ParsedArgs {
@@ -459,13 +481,107 @@ mod tests {
 
     #[test]
     fn run_bounded_propagates_directory_results() {
+        // With a shared backlog rather than fixed batches, results are no
+        // longer guaranteed to come back in input order (two workers can
+        // finish in either order) - match each directory's outcome by name
+        // instead of asserting a fixed result sequence.
         let dirs: Vec<PathBuf> = vec![PathBuf::from("ok"), PathBuf::from("bad")];
         let results = run_bounded(&dirs, 2, |dir| dir.to_string_lossy() != "bad");
 
-        let outcomes: Vec<bool> = results
+        let mut outcomes: HashMap<String, bool> = results
             .into_iter()
-            .map(|(_, result)| result.unwrap())
+            .map(|(dir, result)| (dir, result.unwrap()))
             .collect();
-        assert_eq!(outcomes, vec![true, false]);
+        assert_eq!(outcomes.remove("ok"), Some(true));
+        assert_eq!(outcomes.remove("bad"), Some(false));
+        assert!(outcomes.is_empty());
+    }
+
+    #[test]
+    fn run_bounded_isolates_a_panic_to_its_own_directory() {
+        // Regression test for the persistent-worker redesign: a worker
+        // thread now handles many directories over its lifetime instead of
+        // exactly one, so a panic inside `work` must not take the rest of
+        // that worker's future directories down with it.
+        let dirs: Vec<PathBuf> = (0..6).map(|i| PathBuf::from(format!("dir-{i}"))).collect();
+
+        let results = run_bounded(&dirs, 2, |dir| {
+            if dir.to_string_lossy() == "dir-3" {
+                panic!("boom");
+            }
+            true
+        });
+
+        assert_eq!(results.len(), 6);
+        let mut succeeded = 0;
+        let mut panicked = 0;
+        for (_, result) in results {
+            match result {
+                Ok(true) => succeeded += 1,
+                Ok(false) => panic!("no directory in this test returns false"),
+                Err(_) => panicked += 1,
+            }
+        }
+        assert_eq!(succeeded, 5);
+        assert_eq!(panicked, 1);
+    }
+
+    #[test]
+    fn run_bounded_never_spawns_more_workers_than_directories() {
+        // Requesting more concurrency than there is work must not spawn
+        // idle worker threads for directories that don't exist.
+        let dirs: Vec<PathBuf> = vec![PathBuf::from("only-one")];
+        let results = run_bounded(&dirs, 8, |_dir| true);
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn run_bounded_handles_empty_input() {
+        let results = run_bounded(&[], 4, |_dir| true);
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn run_bounded_lets_a_free_worker_pick_up_the_next_directory_immediately() {
+        // Regression test for the shared-backlog redesign: directories used
+        // to be split into fixed-size chunks, and the next chunk only
+        // started once every thread in the current one finished - a single
+        // slow directory sharing a chunk with a fast one held up not just
+        // its own chunk but every later chunk's start too. Now a free
+        // worker immediately claims the next unclaimed directory, so 20
+        // fast directories running alongside one slow one (with a second
+        // worker free to drain them) finish in roughly the slower of "the
+        // one slow directory" and "20 fast ones run back-to-back by one
+        // worker" - not "slow" plus several additional chunk-rounds of fast
+        // ones serialized behind it on top of that.
+        //
+        // With chunk size 2: [slow, fast] pairs the slow directory with one
+        // fast one (~400ms for that chunk), then the remaining 19 fast
+        // directories still need 10 more chunk-rounds (~15ms each) *after*
+        // that ~400ms, landing around 550ms+. The shared-backlog version
+        // instead has one worker occupied by the slow directory for 400ms
+        // while the other worker drains all 20 fast directories
+        // (~20 * 15ms = 300ms) in parallel, finishing around 400-450ms.
+        let mut dirs = vec![PathBuf::from("slow")];
+        dirs.extend((0..20).map(|i| PathBuf::from(format!("fast-{i}"))));
+
+        let start = Instant::now();
+        let results = run_bounded(&dirs, 2, |dir| {
+            let sleep = if dir.to_string_lossy() == "slow" {
+                Duration::from_millis(400)
+            } else {
+                Duration::from_millis(15)
+            };
+            thread::sleep(sleep);
+            true
+        });
+        let elapsed = start.elapsed();
+
+        assert_eq!(results.len(), 21);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "expected the fast directories to finish alongside the slow one \
+             rather than serialized behind chunk boundaries, took {elapsed:?}"
+        );
     }
 }
