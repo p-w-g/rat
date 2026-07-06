@@ -54,14 +54,31 @@ struct Outcome {
     body: String,
 }
 
+/// Builds the `Command` that runs `command` through the platform shell.
+///
+/// On Windows this deliberately uses `raw_arg` instead of `arg`/`args` for
+/// the command text: `Command::arg` applies Rust's own Windows
+/// argv-quoting convention to whatever it's given, which would re-escape
+/// the quotes `exec::quoting` already built for cmd.exe's benefit (e.g.
+/// doubling their embedded `"` a second time), corrupting an
+/// already-correct command line. `raw_arg` appends the text to the command
+/// line verbatim, which is what a `cmd.exe /c <text>` invocation needs -
+/// cmd.exe (and, in turn, whatever program it invokes) does its own
+/// parsing of that text, not Rust's.
 #[cfg(target_os = "windows")]
-fn shell_invocation(command: &str) -> (&'static str, Vec<String>) {
-    ("cmd.exe", vec!["/c".to_string(), command.to_string()])
+fn shell_command(command: &str) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut cmd = Command::new("cmd.exe");
+    cmd.arg("/c");
+    cmd.raw_arg(command);
+    cmd
 }
 
 #[cfg(not(target_os = "windows"))]
-fn shell_invocation(command: &str) -> (&'static str, Vec<String>) {
-    ("/bin/bash", vec!["-c".to_string(), command.to_string()])
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new("/bin/bash");
+    cmd.arg("-c").arg(command);
+    cmd
 }
 
 fn run_command_inner(
@@ -70,10 +87,7 @@ fn run_command_inner(
     sustain: bool,
     timeout: Option<Duration>,
 ) -> std::io::Result<Outcome> {
-    let (shell, shell_args) = shell_invocation(command);
-
-    let mut child = Command::new(shell)
-        .args(&shell_args)
+    let mut child = shell_command(command)
         .current_dir(working_directory)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
