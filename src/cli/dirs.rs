@@ -9,16 +9,23 @@ use std::path::{Path, PathBuf};
 /// Takes already-extracted primitives rather than `ParsedArgs`/`Config`
 /// directly so this stays a leaf module with no dependency on `cli`'s own
 /// parser output or on the `config` module's types.
-pub fn assume_working_directory(local_flag: bool, default_folder: Option<&str>) -> PathBuf {
-    let cwd = || std::env::current_dir().expect("current directory should be accessible");
-
+///
+/// Returns `io::Result` rather than panicking on a failed `current_dir()`
+/// call (e.g. the CWD was deleted or unmounted out from under the running
+/// process) - a real, if rare, possibility that used to crash the whole
+/// program via `.expect(...)`, inconsistent with every other fallible path
+/// in this tool, which degrades to a printed error instead.
+pub fn assume_working_directory(
+    local_flag: bool,
+    default_folder: Option<&str>,
+) -> io::Result<PathBuf> {
     if local_flag {
-        return cwd();
+        return std::env::current_dir();
     }
 
     match default_folder {
-        Some(folder) => PathBuf::from(folder),
-        None => cwd(),
+        Some(folder) => Ok(PathBuf::from(folder)),
+        None => std::env::current_dir(),
     }
 }
 
@@ -126,19 +133,19 @@ mod tests {
 
     #[test]
     fn local_flag_forces_cwd_even_with_default_folder() {
-        let result = assume_working_directory(true, Some("/configured/default"));
+        let result = assume_working_directory(true, Some("/configured/default")).unwrap();
         assert_eq!(result, std::env::current_dir().unwrap());
     }
 
     #[test]
     fn default_folder_wins_when_local_not_set() {
-        let result = assume_working_directory(false, Some("/configured/default"));
+        let result = assume_working_directory(false, Some("/configured/default")).unwrap();
         assert_eq!(result, PathBuf::from("/configured/default"));
     }
 
     #[test]
     fn falls_back_to_cwd_when_nothing_configured() {
-        let result = assume_working_directory(false, None);
+        let result = assume_working_directory(false, None).unwrap();
         assert_eq!(result, std::env::current_dir().unwrap());
     }
 

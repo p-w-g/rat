@@ -55,7 +55,13 @@ pub fn run_parallel(instance: &ParsedArgs) -> bool {
 
     let local_flag = instance.options.contains_key("local");
     let working_directory =
-        dirs::assume_working_directory(local_flag, config.default_folder.as_deref());
+        match dirs::assume_working_directory(local_flag, config.default_folder.as_deref()) {
+            Ok(dir) => dir,
+            Err(e) => {
+                println!("Couldn't determine the working directory: {e}");
+                return false;
+            }
+        };
 
     let ignored = config.ignored_folders.as_deref();
     let filter = FilterExpression::new(
