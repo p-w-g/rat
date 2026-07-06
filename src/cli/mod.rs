@@ -58,12 +58,17 @@ fn parse_argument(arg: &str, parsed: &mut ParsedArgs) {
 fn parse_option(option: &str, parsed: &mut ParsedArgs) {
     let mut parts = option.split('-');
     let key = parts.next().unwrap_or("").to_string();
-    // A leading/trailing/doubled dash (e.g. "--skip-" or "--only--a-b") produces
-    // empty segments here. Left unfiltered, an empty string matches every
-    // substring check downstream in cli::dirs (`"anything".contains("")` is
-    // always true), silently turning `--skip-` into "skip every directory"
-    // and `--only--a-b` into "only" not restricting anything at all.
+    // Each dash-separated segment may itself be a comma-separated list (e.g.
+    // "--only-uk,fi" or "--only-uk,fi-nl"), so split on both and flatten.
+    //
+    // A leading/trailing/doubled dash or comma (e.g. "--skip-" or
+    // "--only--a-b" or "--only-a,") produces empty segments here. Left
+    // unfiltered, an empty string would trivially satisfy any filter built
+    // from it downstream, silently turning "--skip-" into "skip every
+    // directory" and "--only--a-b" into "only" not restricting anything at
+    // all.
     let values: Vec<String> = parts
+        .flat_map(|segment| segment.split(','))
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
@@ -149,6 +154,30 @@ mod tests {
             parsed.options.get("only"),
             Some(&vec!["a".to_string(), "b".to_string()])
         );
+    }
+
+    #[test]
+    fn comma_separated_values_are_split() {
+        let parsed = parse_instance(&args(&["--only-uk,fi"]));
+        assert_eq!(
+            parsed.options.get("only"),
+            Some(&vec!["uk".to_string(), "fi".to_string()])
+        );
+    }
+
+    #[test]
+    fn comma_and_dash_separated_values_combine() {
+        let parsed = parse_instance(&args(&["--only-uk,fi-nl"]));
+        assert_eq!(
+            parsed.options.get("only"),
+            Some(&vec!["uk".to_string(), "fi".to_string(), "nl".to_string()])
+        );
+    }
+
+    #[test]
+    fn trailing_comma_produces_no_extra_empty_value() {
+        let parsed = parse_instance(&args(&["--only-uk,"]));
+        assert_eq!(parsed.options.get("only"), Some(&vec!["uk".to_string()]));
     }
 
     #[test]
