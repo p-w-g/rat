@@ -168,6 +168,11 @@ Config lives at `~/.ratconfig` (JSON), created on first use of `cfg`.
 | `cfg to <seconds>`                   | set a default timeout for `fep`; `0` disables it                        |
 | `cfg nto`                            | disable the default timeout                                             |
 
+> `.git` is always excluded from `fep` runs, even with an empty `cfg
+> ignore` list - it's not a preference to override, just something nobody
+> wants a fanned-out command run inside. Everything else you want skipped
+> (`node_modules`, `.idea`, ...) is up to `cfg ignore`.
+
 ## Development
 
 ```bash

@@ -379,3 +379,22 @@ fn fep_preserves_a_quoted_multi_word_argument() {
          command line"
     );
 }
+
+#[test]
+fn fep_never_runs_inside_a_dot_git_directory() {
+    // .git is always excluded, even with no `cfg ignore` configuration at
+    // all - a fresh install shouldn't try to shell out inside it on the
+    // very first real-world run.
+    let dir = tempfile::tempdir().unwrap();
+    create_dirs(dir.path(), &["repo-a", ".git"]);
+
+    let output = rat()
+        .args(["fep", "echo", "marker", "--local"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains(&dir.path().join("repo-a").display().to_string()));
+    assert!(!stdout.contains(&dir.path().join(".git").display().to_string()));
+}

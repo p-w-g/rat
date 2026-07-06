@@ -43,6 +43,15 @@ pub fn available_directories(
     ))
 }
 
+/// Folders excluded from every `fep` run regardless of `cfg
+/// ignore`/`cfg heed` configuration. This isn't a user preference to
+/// override - nobody wants a fanned-out command run inside a repo's own
+/// `.git` directory - so on a fresh install (empty `cfg ignore` list) the
+/// very first real-world run doesn't immediately try to `git pull` (or
+/// whatever) `.git` itself. `cfg ignore`/`cfg heed` remain the mechanism
+/// for anything else a user wants excluded.
+const ALWAYS_IGNORED: &[&str] = &[".git"];
+
 /// Pure filtering logic, separated from the real directory listing above so
 /// it's testable against fabricated paths with no filesystem involved.
 ///
@@ -56,10 +65,11 @@ fn filter_available_directories(
     ignored_folders: Option<&[String]>,
     filter: &FilterExpression,
 ) -> Vec<PathBuf> {
-    let mut directories = all_directories;
+    let mut directories =
+        remove_ignored_directories(all_directories, ALWAYS_IGNORED.iter().copied());
 
     if let Some(ignored) = ignored_folders {
-        directories = remove_ignored_directories(directories, ignored);
+        directories = remove_ignored_directories(directories, ignored.iter().map(String::as_str));
     }
 
     if !filter.is_empty() {
@@ -73,19 +83,24 @@ fn filter_available_directories(
     directories
 }
 
-/// The permanently-ignored list (`cfg ignore`) is matched by substring on
-/// the full path, same as the original's `dir.Contains(path)`. This is a
-/// separate, persistent, path-based exclusion list rather than a per-run
-/// `--only`/`--skip` filter, so it's deliberately left out of the
-/// component matcher above - `.git`/`.idea`/etc. entries are exact folder
-/// names in practice, and users may reasonably ignore a path fragment
-/// rather than a single name component.
-fn remove_ignored_directories(directories: Vec<PathBuf>, paths: &[String]) -> Vec<PathBuf> {
+/// The permanently-ignored list (`cfg ignore`, plus the built-in
+/// `ALWAYS_IGNORED`) is matched by substring on the full path, same as the
+/// original's `dir.Contains(path)`. This is a separate, persistent,
+/// path-based exclusion list rather than a per-run `--only`/`--skip`
+/// filter, so it's deliberately left out of the component matcher above -
+/// `.git`/`.idea`/etc. entries are exact folder names in practice, and
+/// users may reasonably ignore a path fragment rather than a single name
+/// component.
+fn remove_ignored_directories<'a>(
+    directories: Vec<PathBuf>,
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Vec<PathBuf> {
+    let paths: Vec<&str> = paths.into_iter().collect();
     directories
         .into_iter()
         .filter(|dir| {
             let dir_str = dir.to_string_lossy();
-            !paths.iter().any(|p| dir_str.contains(p.as_str()))
+            !paths.iter().any(|p| dir_str.contains(p))
         })
         .collect()
 }
@@ -129,9 +144,19 @@ mod tests {
 
     #[test]
     fn no_filters_passes_through_unchanged() {
-        let all = paths(&["/w/api", "/w/web", "/w/.git"]);
+        let all = paths(&["/w/api", "/w/web", "/w/docs"]);
         let result = filter_available_directories(all.clone(), None, &FilterExpression::default());
         assert_eq!(result, all);
+    }
+
+    #[test]
+    fn dot_git_is_always_ignored_even_without_any_configuration() {
+        // .git is never something a `fep` run should shell into; this must
+        // hold even on a fresh install with an empty `cfg ignore` list, not
+        // just once a user has explicitly configured it.
+        let all = paths(&["/w/api", "/w/.git"]);
+        let result = filter_available_directories(all, None, &FilterExpression::default());
+        assert_eq!(result, paths(&["/w/api"]));
     }
 
     #[test]
